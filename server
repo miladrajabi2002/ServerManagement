@@ -262,7 +262,7 @@ install_bbr() {
     
     # Add BBR
     echo "" >> "$SYSCTL_CONF"
-    echo "# BBR Congestion Control - Installed by Server Tool v3.0" >> "$SYSCTL_CONF"
+    echo "# BBR Congestion Control - Installed by Server Management v3.0" >> "$SYSCTL_CONF"
     echo "net.core.default_qdisc=fq" >> "$SYSCTL_CONF"
     echo "net.ipv4.tcp_congestion_control=bbr" >> "$SYSCTL_CONF"
     show_progress 3 4 "Writing BBR configuration"
@@ -346,7 +346,7 @@ install_hybla() {
     
     # Add Hybla
     echo "" >> "$SYSCTL_CONF"
-    echo "# Hybla Congestion Control - Installed by Server Tool v3.0" >> "$SYSCTL_CONF"
+    echo "# Hybla Congestion Control - Installed by Server Management v3.0" >> "$SYSCTL_CONF"
     echo "net.core.default_qdisc=fq" >> "$SYSCTL_CONF"
     echo "net.ipv4.tcp_congestion_control=hybla" >> "$SYSCTL_CONF"
     
@@ -802,7 +802,7 @@ optimize_dns() {
         chattr -i /etc/resolv.conf 2>/dev/null || true
         
         cat > /etc/resolv.conf << EOF
-# DNS Configuration - Auto-configured by Server Tool v3.0
+# DNS Configuration - Auto-configured by Server Management v3.0
 # Fastest DNS: $fastest_name (${fastest_time}ms avg)
 nameserver $fastest_ip
 nameserver $second_ip
@@ -1804,7 +1804,7 @@ main_menu() {
             6) service_log_menu ;;
             0)
                 echo ""
-                echo -e "${GREEN}${BOLD}Thank you for using Server Management Tool!${NC}"
+                echo -e "${GREEN}${BOLD}Thank you for using Server Management!${NC}"
                 echo -e "${DIM}Stay optimized! 🚀${NC}\n"
                 exit 0
                 ;;
