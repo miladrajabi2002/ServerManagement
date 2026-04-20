@@ -14,7 +14,7 @@ NC='\033[0m'
 
 # GitHub repository info
 GITHUB_USER="miladrajabi2002"
-GITHUB_REPO="server"
+GITHUB_REPO="ServerManagement"
 GITHUB_BRANCH="main"
 SCRIPT_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}/server"
 
@@ -86,8 +86,8 @@ chmod +x /usr/local/bin/server
 echo -e "${GREEN}✓${NC} Installation completed successfully!\n"
 
 echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}Server Management Tool is now installed!${NC}\n"
-echo -e "Run the tool with: ${YELLOW}sudo server${NC}\n"
+echo -e "${GREEN}Server Management is now installed!${NC}\n"
+echo -e "Run with: ${YELLOW}sudo server${NC}\n"
 echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
 
 # Ask if user wants to run it now
