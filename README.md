@@ -69,13 +69,13 @@ Comprehensive security checks including:
 ### Quick Install (Recommended):
 ```bash
 # Download and install in one command
-curl -fsSL https://raw.githubusercontent.com/miladrajabi2002/server/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/miladrajabi2002/ServerManagement/main/install.sh | sudo bash
 ```
 
 ### Manual Installation:
 ```bash
 # Download the script
-wget https://raw.githubusercontent.com/miladrajabi2002/server/main/server
+wget https://raw.githubusercontent.com/miladrajabi2002/ServerManagement/main/server
 
 # Make it executable
 chmod +x server
@@ -90,8 +90,8 @@ sudo server
 ### From Source:
 ```bash
 # Clone the repository
-git clone https://github.com/miladrajabi2002/server.git
-cd server-tool
+git clone https://github.com/miladrajabi2002/ServerManagement.git
+cd ServerManagement
 
 # Install
 sudo bash install.sh
