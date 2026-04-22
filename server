@@ -1436,6 +1436,42 @@ manage_nginx() {
     done
 }
 
+launch_advanced_monitoring() {
+    print_header "ADVANCED MONITORING"
+
+    local monitor_bin="/usr/local/bin/server-monitor"
+    if [ ! -x "$monitor_bin" ]; then
+        if [ -x "./monitor.sh" ]; then
+            monitor_bin="./monitor.sh"
+        elif [ -x "/usr/local/bin/monitor.sh" ]; then
+            monitor_bin="/usr/local/bin/monitor.sh"
+        else
+            print_status "WARN" "Advanced monitor is not installed"
+            echo -e "${CYAN}Re-run install.sh to install monitor.sh${NC}"
+            press_enter
+            return
+        fi
+    fi
+
+    while true; do
+        print_header "ADVANCED MONITORING"
+        echo -e "  ${BOLD}1${NC}) Snapshot Report"
+        echo -e "  ${BOLD}2${NC}) Live Dashboard"
+        echo -e "  ${BOLD}3${NC}) Deep Log Analytics"
+        echo -e "  ${BOLD}0${NC}) Back"
+        echo ""
+        echo -ne "${YELLOW}Your choice: ${NC}"
+        read mon_choice
+
+        case $mon_choice in
+            1) "$monitor_bin" snapshot ;;
+            2) "$monitor_bin" live ;;
+            3) "$monitor_bin" logs ;;
+            0) break ;;
+            *) print_status "ERROR" "Invalid option"; sleep 1 ;;
+        esac
+    done
+}
 service_log_menu() {
     while true; do
         print_banner
@@ -1464,10 +1500,11 @@ service_log_menu() {
         check_service_status "docker" "Docker"
         
         echo ""
-        echo -e "  ${BOLD}1${NC}) 🌐 Nginx Management"
-        echo -e "  ${BOLD}2${NC}) 📊 System Logs (journalctl)"
-        echo -e "  ${BOLD}3${NC}) 🗑️  Clear All Service Logs"
-        echo -e "  ${BOLD}0${NC}) ← Back"
+        echo -e "  ${BOLD}1${NC}) Nginx Management"
+        echo -e "  ${BOLD}2${NC}) System Logs (journalctl)"
+        echo -e "  ${BOLD}3${NC}) Clear All Service Logs"
+        echo -e "  ${BOLD}4${NC}) Advanced Monitoring Dashboard"
+        echo -e "  ${BOLD}0${NC}) Back"
         echo ""
         echo -ne "${YELLOW}Your choice: ${NC}"
         read choice
@@ -1516,6 +1553,7 @@ service_log_menu() {
                     press_enter
                 fi
                 ;;
+            4) launch_advanced_monitoring ;;
             0) break ;;
             *) print_status "ERROR" "Invalid option"; sleep 1 ;;
         esac
