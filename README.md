@@ -104,15 +104,27 @@ Simply run:
 sudo server
 ```
 
-### Menu Options:
-1. **IP Reputation Check** - Check if your server IP is clean
-2. **MTU Optimization** - Find and set optimal MTU
-3. **Security Audit** - Complete security assessment
-4. **Network Diagnostics** - Network connectivity tests
-5. **Log Analysis** - System log review
-6. **Full Report** - Run all tests and generate report
-7. **View Last Report** - Display previous report
+### Main Menu Options:
+1. **Network & Server Optimization** - BBR, Hybla, MTU, DNS, ping control
+2. **IP Reputation & Security Check** - Multi-source IP analysis
+3. **Optimize Repository Mirrors** - Finds fast package mirrors
+4. **Live Server Monitoring [BTOP]** - Interactive process monitor
+5. **System Benchmark** - Runs benchmark tool
+6. **Service & Log Management** - Nginx/system logs and service actions
 0. **Exit** - Close the tool
+
+### Advanced Monitoring Dashboard:
+From Service & Log Management, open **Advanced Monitoring Dashboard** for:
+- Snapshot report (one-time full report)
+- Live dashboard (continuous refresh)
+- Deep log analytics (precise Nginx/PHP/MariaDB/Laravel insights)
+
+You can also run it directly:
+```bash
+sudo server-monitor snapshot
+sudo server-monitor live
+sudo server-monitor logs
+```
 
 ## Requirements 📦
 
