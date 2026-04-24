@@ -1965,32 +1965,49 @@ show_drift_detection() {
     print_breadcrumb "Service & Log Management > Runtime Audit > Drift Detection"
     print_context_help "Compares current runtime items with a baseline snapshot."
 
-    local current_file
+    local current_file baseline_sorted added removed
     current_file=$(mktemp)
+    baseline_sorted=$(mktemp)
+
     {
-        systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | awk '{print "svc:"$1}'
-        ps -eo comm= 2>/dev/null | grep -Ev '^kworker' | sort -u | head -n 300 | awk '{print "proc:"$1}'
+        systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null \
+            | awk '{print "svc:"$1}'
+
+        ps -eo comm= 2>/dev/null \
+            | grep -Ev '^(kworker|ksoftirqd|migration|rcu_|watchdog|idle_inject|cpuhp|scsi_|irq/|kauditd|kswapd|oom_reaper)$' \
+            | awk 'NF {print "proc:"$1}'
     } | sort -u > "$current_file"
 
     if [ ! -f "$DRIFT_BASELINE_FILE" ]; then
         cp "$current_file" "$DRIFT_BASELINE_FILE"
         print_status "INFO" "Baseline created: $DRIFT_BASELINE_FILE"
-        rm -f "$current_file"
+        rm -f "$current_file" "$baseline_sorted"
         return
     fi
 
-    local added removed
-    added=$(comm -13 "$DRIFT_BASELINE_FILE" "$current_file" | head -n 10)
-    removed=$(comm -23 "$DRIFT_BASELINE_FILE" "$current_file" | head -n 10)
+    sort -u "$DRIFT_BASELINE_FILE" > "$baseline_sorted"
+
+    added=$(comm -13 "$baseline_sorted" "$current_file" | head -n 10)
+    removed=$(comm -23 "$baseline_sorted" "$current_file" | head -n 10)
 
     if [ -z "$added" ] && [ -z "$removed" ]; then
         print_status "SUCCESS" "No runtime drift detected"
     else
-        [ -n "$added" ] && { print_status "WARN" "New runtime items detected:"; echo "$added" | sed 's/^/  + /'; }
-        [ -n "$removed" ] && { print_status "WARN" "Missing baseline items detected:"; echo "$removed" | sed 's/^/  - /'; }
+        [ -n "$added" ] && {
+            print_status "WARN" "New runtime items detected:"
+            echo "$added" | sed 's/^/  + /'
+        }
+
+        [ -n "$removed" ] && {
+            print_status "WARN" "Missing baseline items detected:"
+            echo "$removed" | sed 's/^/  - /'
+        }
+
+        print_status "INFO" "If these changes are expected, refresh baseline manually."
+        echo "  Command: cp $current_file $DRIFT_BASELINE_FILE"
     fi
 
-    rm -f "$current_file"
+    rm -f "$current_file" "$baseline_sorted"
 }
 
 show_process_intelligence() {
