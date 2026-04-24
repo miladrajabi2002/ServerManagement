@@ -116,10 +116,15 @@ sudo server
 ### Service & Log Management Dashboard:
 The **Service & Log Management** section now provides a unified one-page dashboard for:
 - Installed service checks (Nginx, Apache, PHP-FPM, DB, Redis/Dragonfly, Docker)
-- Automatic error digest from logs and journal
+- Unified log pipeline (journald + /var/log + service logs) with normalized records
+- Smart error digest (Auth, Disk I/O, OOM, Segfault, TLS/SSL) with first/last seen + counts
+- Log anomaly detection (15m vs previous 15m spike detection)
 - Nginx request intelligence (top URLs, high-rate IPs, 404 scans, suspicious user agents)
 - PHP-FPM worker count + capacity analysis
 - Database and cache quick health metrics
+- Software inventory, startup/autorun audit, runtime execution map, and baseline drift detection
+- Process intelligence (top CPU/RAM), duplicate-process detection, abnormal-pattern detection, action center
+- Improved UX with breadcrumb and contextual help across sections
 - One-click reset for file logs + journal logs
 
 ## Requirements 📦

@@ -24,9 +24,13 @@ SYSCTL_CONF="/etc/sysctl.conf"
 BACKUP_DIR="/root/server-tool-backups"
 NGINX_ACCESS_LOG="/var/log/nginx/access.log"
 NGINX_ERROR_LOG="/var/log/nginx/error.log"
+STATE_DIR="/var/lib/server-management"
+LOG_PIPELINE_FILE="/tmp/server-log-pipeline.ndjson"
+DRIFT_BASELINE_FILE="$STATE_DIR/runtime-baseline.txt"
 
 # Create backup directory
 mkdir -p "$BACKUP_DIR"
+mkdir -p "$STATE_DIR"
 
 #==============================================================================
 # Utility Functions - Modern Design
@@ -56,6 +60,16 @@ print_section() {
     echo -e "\n${BLUE}${BOLD}┌─────────────────────────────────────────────────────────────┐${NC}"
     printf "${BLUE}${BOLD}│${NC} ${BOLD}%-59s${NC} ${BLUE}${BOLD}│${NC}\n" "$1"
     echo -e "${BLUE}${BOLD}└─────────────────────────────────────────────────────────────┘${NC}\n"
+}
+
+print_breadcrumb() {
+    local path="$1"
+    echo -e "${DIM}  ${path}${NC}"
+}
+
+print_context_help() {
+    local help_text="$1"
+    echo -e "${GRAY}  💡 ${help_text}${NC}"
 }
 
 print_status() {
@@ -1415,6 +1429,8 @@ print_installed_services_overview() {
     local php_service=""
 
     print_section "INSTALLED SERVICE STATUS"
+    print_breadcrumb "Service & Log Management > Services > Installed Status"
+    print_context_help "وضعیت سرویس‌های نصب‌شده به‌همراه نمایش Running/Stopped."
 
     if service_exists "nginx"; then
         check_service_status "nginx" "Nginx"
@@ -1480,6 +1496,8 @@ print_installed_services_overview() {
 
 show_nginx_section() {
     print_section "NGINX ANALYTICS"
+    print_breadcrumb "Service & Log Management > Services > Nginx"
+    print_context_help "ترافیک، URLهای پرتکرار، 404 و User-Agent مشکوک برای Nginx."
     if ! service_exists "nginx"; then
         print_status "WARN" "Nginx is not installed"
         return
@@ -1514,6 +1532,8 @@ show_nginx_section() {
 
 show_php_section() {
     print_section "PHP-FPM ANALYTICS"
+    print_breadcrumb "Service & Log Management > Services > PHP-FPM"
+    print_context_help "وضعیت سرویس، تعداد worker و ظرفیت pm.max_children."
     local php_service
     php_service=$(find_php_fpm_service)
     if [ -z "$php_service" ]; then
@@ -1542,6 +1562,8 @@ show_php_section() {
 
 show_database_section() {
     print_section "DATABASE ANALYTICS"
+    print_breadcrumb "Service & Log Management > Services > Database"
+    print_context_help "اتصال‌های فعال/خوابیده و خطاهای مهم MySQL/MariaDB."
     local db_service=""
     if service_exists "mysql"; then
         db_service="mysql"
@@ -1575,6 +1597,8 @@ SELECT
 
 show_cache_section() {
     print_section "REDIS / DRAGONFLY ANALYTICS"
+    print_breadcrumb "Service & Log Management > Services > Cache"
+    print_context_help "memory, client count و هشدارهای Redis/Dragonfly."
     local cache_service=""
     if service_exists "dragonfly"; then
         cache_service="dragonfly"
@@ -1605,6 +1629,8 @@ show_cache_section() {
 
 show_apache_section() {
     print_section "APACHE ANALYTICS"
+    print_breadcrumb "Service & Log Management > Services > Apache"
+    print_context_help "وضعیت Apache و آخرین خطاهای مهم."
     local apache_service=""
     local apache_error_log="/var/log/apache2/error.log"
 
@@ -1637,8 +1663,262 @@ show_apache_section() {
 
 show_general_error_digest() {
     print_section "GLOBAL ERROR DIGEST"
+    print_breadcrumb "Service & Log Management > Logs > Global Digest"
+    print_context_help "نمایش 15 خطای آخر سیستم. برای بازه زمانی از منوی لاگ حرفه‌ای استفاده کنید."
     print_status "INFO" "Latest system errors (journalctl -p err -n 15):"
     journalctl -p err -n 15 --no-pager 2>/dev/null
+}
+
+normalize_log_line() {
+    local source="$1"
+    local service="$2"
+    local raw_line="$3"
+
+    local ts host pid severity message
+    ts=$(echo "$raw_line" | awk '{print $1" "$2" "$3}')
+    host=$(echo "$raw_line" | awk '{print $4}')
+    pid=$(echo "$raw_line" | sed -n 's/.*\[\([0-9]\+\)\].*/\1/p' | head -n1)
+    [ -z "$pid" ] && pid="-"
+
+    if echo "$raw_line" | grep -qiE "panic|crit|critical|emerg|alert"; then
+        severity="critical"
+    elif echo "$raw_line" | grep -qiE "error|fail|denied"; then
+        severity="error"
+    elif echo "$raw_line" | grep -qiE "warn|warning|deprecated"; then
+        severity="warning"
+    else
+        severity="info"
+    fi
+
+    message=$(echo "$raw_line" | sed 's/"/'\''/g')
+    printf '{"timestamp":"%s","host":"%s","service":"%s","severity":"%s","message":"%s","source_file":"%s","pid":"%s"}\n' \
+        "$ts" "${host:-localhost}" "$service" "$severity" "$message" "$source" "$pid" >> "$LOG_PIPELINE_FILE"
+}
+
+build_unified_log_pipeline() {
+    print_section "UNIFIED LOG PIPELINE"
+    print_breadcrumb "Service & Log Management > Logs > Pipeline"
+    print_context_help "لاگ journald و فایل‌ها در فرمت NDJSON نرمال می‌شوند."
+
+    : > "$LOG_PIPELINE_FILE"
+
+    while IFS= read -r line; do
+        normalize_log_line "journald" "system" "$line"
+    done < <(journalctl -p err -n 120 --no-pager 2>/dev/null)
+
+    for file in /var/log/syslog /var/log/messages /var/log/auth.log "$NGINX_ERROR_LOG" /var/log/mysql/error.log /var/log/redis/redis-server.log; do
+        [ -f "$file" ] || continue
+        while IFS= read -r line; do
+            normalize_log_line "$file" "$(basename "$file")" "$line"
+        done < <(tail -n 60 "$file" 2>/dev/null)
+    done
+
+    local count
+    count=$(wc -l < "$LOG_PIPELINE_FILE" 2>/dev/null)
+    print_status "SUCCESS" "Pipeline generated with ${count:-0} normalized records"
+    print_status "INFO" "Output file: $LOG_PIPELINE_FILE"
+}
+
+print_error_digest_row() {
+    local title="$1"
+    local pattern="$2"
+    local count first_seen last_seen
+    count=$(grep -iE "$pattern" "$LOG_PIPELINE_FILE" 2>/dev/null | wc -l)
+    first_seen=$(grep -iE "$pattern" "$LOG_PIPELINE_FILE" 2>/dev/null | head -n1 | sed -n 's/.*"timestamp":"\([^"]*\)".*/\1/p')
+    last_seen=$(grep -iE "$pattern" "$LOG_PIPELINE_FILE" 2>/dev/null | tail -n1 | sed -n 's/.*"timestamp":"\([^"]*\)".*/\1/p')
+
+    [ -z "$first_seen" ] && first_seen="-"
+    [ -z "$last_seen" ] && last_seen="-"
+    printf "  %-28s | %-6s | %-20s | %-20s\n" "$title" "$count" "$first_seen" "$last_seen"
+}
+
+show_smart_error_digest() {
+    print_section "SMART ERROR DIGEST"
+    print_breadcrumb "Service & Log Management > Logs > Error Digest"
+    print_context_help "Top Errors + First Seen + Last Seen + Count"
+
+    if [ ! -s "$LOG_PIPELINE_FILE" ]; then
+        print_status "WARN" "Pipeline is empty. Building it now..."
+        build_unified_log_pipeline
+    fi
+
+    echo -e "${BOLD}  Category                      | Count  | First Seen           | Last Seen${NC}"
+    echo "  ------------------------------------------------------------------------------------------"
+    print_error_digest_row "Auth failures" "failed password|authentication failure|invalid user"
+    print_error_digest_row "Disk I/O" "I/O error|read-only file system|blk_update_request|buffer i/o"
+    print_error_digest_row "OOM killer" "out of memory|oom-killer|killed process"
+    print_error_digest_row "Segfault" "segfault|core dumped|general protection fault"
+    print_error_digest_row "TLS/SSL handshake" "tls|ssl|handshake|certificate|x509"
+}
+
+show_log_anomaly_detection() {
+    print_section "LOG ANOMALY DETECTION"
+    print_breadcrumb "Service & Log Management > Logs > Anomaly Detection"
+    print_context_help "مقایسه خطاهای 15 دقیقه اخیر با 15 دقیقه قبل برای تشخیص جهش ناگهانی."
+
+    local recent previous new_patterns
+    recent=$(journalctl --since "15 min ago" -p err --no-pager 2>/dev/null | wc -l)
+    previous=$(journalctl --since "30 min ago" --until "15 min ago" -p err --no-pager 2>/dev/null | wc -l)
+
+    print_status "INFO" "Recent errors (15m): $recent"
+    print_status "INFO" "Previous window errors (15m): $previous"
+
+    if [ "$previous" -eq 0 ] && [ "$recent" -gt 0 ]; then
+        print_status "WARN" "New error burst detected (no errors in previous window)"
+    elif [ "$previous" -gt 0 ] && [ "$recent" -ge $((previous * 2)) ]; then
+        print_status "WARN" "Error rate spike detected (>=2x)"
+    else
+        print_status "SUCCESS" "No significant anomaly detected"
+    fi
+
+    new_patterns=$(journalctl --since "15 min ago" -p err --no-pager 2>/dev/null | awk '{$1=$2=$3=""; print $0}' | sort -u | head -n 5)
+    if [ -n "$new_patterns" ]; then
+        echo -e "${CYAN}${BOLD}  Recent unique patterns:${NC}"
+        echo "$new_patterns" | sed 's/^/    - /'
+    fi
+}
+
+show_software_inventory() {
+    print_section "SOFTWARE INVENTORY"
+    print_breadcrumb "Service & Log Management > Runtime Audit > Installed Software"
+    print_context_help "نمایش نسخه، منبع نصب و قابلیت مقایسه بین سرورها (خروجی متنی)."
+
+    if command -v dpkg-query >/dev/null 2>&1; then
+        print_status "INFO" "Detected package manager: apt/dpkg"
+        dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null | head -n 20 | awk '{printf "  %-35s %s\n",$1,$2}'
+    elif command -v rpm >/dev/null 2>&1; then
+        print_status "INFO" "Detected package manager: rpm/yum/dnf"
+        rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n' 2>/dev/null | head -n 20 | awk '{printf "  %-35s %s\n",$1,$2}'
+    else
+        print_status "WARN" "No supported package manager found for inventory"
+    fi
+}
+
+show_startup_autorun_audit() {
+    print_section "STARTUP & AUTORUN AUDIT"
+    print_breadcrumb "Service & Log Management > Runtime Audit > Auto-start"
+    print_context_help "شناسایی سرویس‌ها/کران‌جاب‌های auto-start و موارد مشکوک."
+
+    print_status "INFO" "Enabled systemd services (top 20):"
+    systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | head -n 20 | awk '{print "  - "$1}'
+
+    echo -e "\n${CYAN}${BOLD}  @reboot cron entries:${NC}"
+    (crontab -l 2>/dev/null | grep -i '@reboot' || true) | sed 's/^/  - /'
+
+    [ -f /etc/crontab ] && grep -n '@reboot' /etc/crontab 2>/dev/null | sed 's/^/  - \/etc\/crontab:/'
+    [ -f /etc/rc.local ] && print_status "WARN" "rc.local exists - verify startup commands manually"
+}
+
+show_runtime_execution_map() {
+    print_section "RUNTIME EXECUTION MAP"
+    print_breadcrumb "Service & Log Management > Runtime Audit > Running Items"
+    print_context_help "نمایش سرویس‌های فعال و پردازش‌های detached/کانتینرها."
+
+    print_status "INFO" "Active services count: $(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | wc -l)"
+    systemctl list-units --type=service --state=running --no-legend 2>/dev/null | head -n 12 | awk '{print "  - "$1}'
+
+    echo -e "\n${CYAN}${BOLD}  Top detached processes:${NC}"
+    ps -eo pid,ppid,user,%cpu,%mem,comm --sort=-%cpu | awk '$2==1 {printf "  - PID:%s USER:%s CPU:%s MEM:%s CMD:%s\n",$1,$3,$4,$5,$6}' | head -n 10
+
+    if command -v docker >/dev/null 2>&1; then
+        echo -e "\n${CYAN}${BOLD}  Docker workloads:${NC}"
+        docker ps --format '  - {{.Names}} | {{.Status}} | {{.Image}}' 2>/dev/null | head -n 10
+    fi
+}
+
+show_drift_detection() {
+    print_section "DRIFT DETECTION"
+    print_breadcrumb "Service & Log Management > Runtime Audit > Drift Detection"
+    print_context_help "مقایسه وضعیت فعلی اجرا با baseline مرجع."
+
+    local current_file
+    current_file=$(mktemp)
+    {
+        systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | awk '{print "svc:"$1}'
+        ps -eo comm= 2>/dev/null | sort -u | head -n 300 | awk '{print "proc:"$1}'
+    } | sort -u > "$current_file"
+
+    if [ ! -f "$DRIFT_BASELINE_FILE" ]; then
+        cp "$current_file" "$DRIFT_BASELINE_FILE"
+        print_status "INFO" "Baseline created: $DRIFT_BASELINE_FILE"
+        rm -f "$current_file"
+        return
+    fi
+
+    local added removed
+    added=$(comm -13 "$DRIFT_BASELINE_FILE" "$current_file" | head -n 10)
+    removed=$(comm -23 "$DRIFT_BASELINE_FILE" "$current_file" | head -n 10)
+
+    if [ -z "$added" ] && [ -z "$removed" ]; then
+        print_status "SUCCESS" "No runtime drift detected"
+    else
+        [ -n "$added" ] && { print_status "WARN" "New runtime items detected:"; echo "$added" | sed 's/^/  + /'; }
+        [ -n "$removed" ] && { print_status "WARN" "Missing baseline items detected:"; echo "$removed" | sed 's/^/  - /'; }
+    fi
+
+    rm -f "$current_file"
+}
+
+show_process_intelligence() {
+    print_section "PROCESS INTELLIGENCE DASHBOARD"
+    print_breadcrumb "Service & Log Management > Processes > Intelligence"
+    print_context_help "نمایش top مصرف CPU/RAM/IO به همراه user و uptime."
+
+    echo -e "${CYAN}${BOLD}  Top CPU processes:${NC}"
+    ps -eo pid,user,%cpu,%mem,etime,comm,args --sort=-%cpu | head -n 8 | awk '{printf "  PID:%-7s USER:%-10s CPU:%-6s MEM:%-6s UPTIME:%-10s CMD:%s\n",$1,$2,$3,$4,$5,$6}'
+    echo -e "\n${CYAN}${BOLD}  Top Memory processes:${NC}"
+    ps -eo pid,user,%cpu,%mem,etime,comm,args --sort=-%mem | head -n 8 | awk '{printf "  PID:%-7s USER:%-10s CPU:%-6s MEM:%-6s UPTIME:%-10s CMD:%s\n",$1,$2,$3,$4,$5,$6}'
+}
+
+show_duplicate_process_detection() {
+    print_section "DUPLICATE PROCESS DETECTION"
+    print_breadcrumb "Service & Log Management > Processes > Duplicates"
+    print_context_help "شناسایی پردازش‌های تکراری بر اساس binary/args/parent tree."
+
+    local duplicates
+    duplicates=$(ps -eo ppid=,comm=,args= 2>/dev/null | awk '{key=$2"|"substr($0,index($0,$3)); c[key]++; if(!sample[key]) sample[key]=$0} END {for (k in c) if (c[k] > 1) printf "%s | count=%d\n", sample[k], c[k]}' | head -n 10)
+    if [ -n "$duplicates" ]; then
+        print_status "WARN" "Potential duplicate workloads:"
+        echo "$duplicates" | sed 's/^/  - /'
+    else
+        print_status "SUCCESS" "No significant duplicate process pattern found"
+    fi
+}
+
+show_process_abnormal_patterns() {
+    print_section "LEAK / ABNORMAL PATTERN DETECTION"
+    print_breadcrumb "Service & Log Management > Processes > Abnormal Patterns"
+    print_context_help "الگوهای پرخطر: CPU pegging, RAM pressure, zombie accumulation."
+
+    local pegged highmem zombies
+    pegged=$(ps -eo pid,comm,%cpu --sort=-%cpu 2>/dev/null | awk '$3 > 90 {print}')
+    highmem=$(ps -eo pid,comm,%mem --sort=-%mem 2>/dev/null | awk '$3 > 20 {print}')
+    zombies=$(ps -eo stat= 2>/dev/null | grep -c Z || true)
+
+    [ -n "$pegged" ] && { print_status "WARN" "CPU pegging processes (>90%):"; echo "$pegged" | head -n 5 | sed 's/^/  - /'; } || print_status "SUCCESS" "No CPU pegging process detected"
+    [ -n "$highmem" ] && { print_status "WARN" "High memory processes (>20%):"; echo "$highmem" | head -n 5 | sed 's/^/  - /'; } || print_status "SUCCESS" "No single process with very high memory usage"
+
+    if [ "$zombies" -gt 0 ]; then
+        print_status "WARN" "Zombie processes detected: $zombies"
+    else
+        print_status "SUCCESS" "No zombie process accumulation"
+    fi
+}
+
+show_process_action_center() {
+    print_section "PROCESS ACTION CENTER"
+    print_breadcrumb "Service & Log Management > Processes > Action Center"
+    print_context_help "اقدامات امن پیشنهادی: nice/renice/ionice/restart/kill + ثبت audit trail."
+
+    cat <<EOF
+  Suggested safe actions:
+    - renice:  renice +5 -p <PID>
+    - ionice:  ionice -c2 -n7 -p <PID>
+    - restart: systemctl restart <service>
+    - stop:    kill -15 <PID>  (graceful)
+    - force:   kill -9 <PID>   (last resort)
+EOF
+    print_status "INFO" "Audit tip: append manual actions to $BACKUP_DIR/action-audit.log"
 }
 
 reset_all_logs() {
@@ -1662,6 +1942,8 @@ reset_all_logs() {
 render_service_log_dashboard() {
     local overview_alert=0
     print_header "SERVICE & LOG MANAGEMENT - UNIFIED DASHBOARD"
+    print_breadcrumb "Main Menu > Service & Log Management"
+    print_context_help "داشبورد یکپارچه لاگ، سرویس‌ها، Runtime Audit و Process Intelligence."
 
     print_installed_services_overview
     overview_alert=$?
@@ -1675,7 +1957,18 @@ render_service_log_dashboard() {
     show_database_section
     show_cache_section
     show_apache_section
+    build_unified_log_pipeline
+    show_smart_error_digest
+    show_log_anomaly_detection
     show_general_error_digest
+    show_software_inventory
+    show_startup_autorun_audit
+    show_runtime_execution_map
+    show_drift_detection
+    show_process_intelligence
+    show_duplicate_process_detection
+    show_process_abnormal_patterns
+    show_process_action_center
 }
 
 service_log_menu() {
