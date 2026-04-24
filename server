@@ -1436,187 +1436,6 @@ manage_nginx() {
     done
 }
 
-find_first_existing_file() {
-    for candidate in "$@"; do
-        [ -f "$candidate" ] && { echo "$candidate"; return 0; }
-    done
-    return 1
-}
-
-show_service_health_snapshot() {
-    print_header "SERVICE HEALTH SNAPSHOT"
-
-    local php_service=""
-    for ver in 8.4 8.3 8.2 8.1 8.0 7.4; do
-        if systemctl list-unit-files 2>/dev/null | grep -q "^php${ver}-fpm.service"; then
-            php_service="php${ver}-fpm"
-            break
-        fi
-    done
-
-    echo -e "${CYAN}${BOLD}Core Services:${NC}\n"
-    [ -n "$php_service" ] && check_service_status "$php_service" "PHP-FPM ($php_service)" || echo -e "  ${DIM}○${NC} PHP-FPM: ${DIM}Not installed${NC}"
-    check_service_status "nginx" "Nginx"
-    check_service_status "mysql" "MySQL" || check_service_status "mariadb" "MariaDB"
-    check_service_status "redis-server" "Redis" || check_service_status "redis" "Redis"
-    check_service_status "docker" "Docker"
-
-    echo ""
-    echo -e "${CYAN}${BOLD}Runtime Metrics:${NC}\n"
-    echo -e "  ${BOLD}Load:${NC} $(awk '{print $1, $2, $3}' /proc/loadavg)"
-    echo -e "  ${BOLD}Memory:${NC} $(free -h | awk '/Mem:/ {print $3\" / \"$2\" (\"int($3/$2*100)\"%)\"}')"
-    echo -e "  ${BOLD}Disk /:${NC} $(df -h / | awk 'END {print $3\" / \"$2\" (\"$5\")\"}')"
-    echo -e "  ${BOLD}Nginx ESTABLISHED(:80/:443):${NC} $(ss -Htn state established '( sport = :80 or sport = :443 )' 2>/dev/null | wc -l)"
-    echo -e "  ${BOLD}PHP-FPM Workers:${NC} $(pgrep -fc 'php-fpm')"
-    echo -e "  ${BOLD}Horizon Workers:${NC} $(pgrep -fc 'horizon:work')"
-
-    if command -v mysql >/dev/null 2>&1; then
-        local db_conn
-        db_conn="$(mysql -N -e "SELECT COUNT(*) FROM information_schema.PROCESSLIST;" 2>/dev/null | head -n1)"
-        echo -e "  ${BOLD}DB Connections:${NC} ${db_conn:-N/A}"
-    else
-        echo -e "  ${BOLD}DB Connections:${NC} N/A"
-    fi
-
-    press_enter
-}
-
-request_analytics_menu() {
-    local access_log
-    access_log="$(find_first_existing_file /var/log/nginx/access.log /var/log/nginx/access.log.1)"
-
-    print_header "REQUEST ANALYTICS"
-
-    if [ -z "${access_log:-}" ]; then
-        print_status "WARN" "Nginx access log not found"
-        press_enter
-        return
-    fi
-
-    echo -e "${DIM}Using log file: ${access_log}${NC}\n"
-    echo -e "  ${BOLD}1${NC}) Quick Request Summary (last 5000)"
-    echo -e "  ${BOLD}2${NC}) Top Endpoints / IPs / Methods"
-    echo -e "  ${BOLD}3${NC}) Error Requests (4xx/5xx) + suspicious paths"
-    echo -e "  ${BOLD}4${NC}) Live Tail (last 30, follow)"
-    echo -e "  ${BOLD}0${NC}) Back"
-    echo ""
-    echo -ne "${YELLOW}Your choice: ${NC}"
-    read req_choice
-
-    case $req_choice in
-        1)
-            print_header "REQUEST SUMMARY (LAST 5000)"
-            tail -n 5000 "$access_log" | awk '
-BEGIN { total=0; s2=0; s3=0; s4=0; s5=0; bytes=0; }
-{
-  total++;
-  code=$9+0;
-  if ($10 ~ /^[0-9]+$/) bytes += $10;
-  if (code>=200 && code<300) s2++;
-  else if (code>=300 && code<400) s3++;
-  else if (code>=400 && code<500) s4++;
-  else if (code>=500 && code<600) s5++;
-}
-END {
-  if (total==0) total=1;
-  printf "Total Requests: %d\n2xx: %d (%.2f%%)\n3xx: %d (%.2f%%)\n4xx: %d (%.2f%%)\n5xx: %d (%.2f%%)\nTransfer: %.2f MB\n",
-         total, s2, s2*100/total, s3, s3*100/total, s4, s4*100/total, s5, s5*100/total, bytes/1024/1024;
-}'
-            press_enter
-            ;;
-        2)
-            print_header "TOP REQUEST INSIGHTS"
-            echo -e "${CYAN}${BOLD}Top 15 Endpoints:${NC}"
-            tail -n 5000 "$access_log" | awk '{print $7}' | sort | uniq -c | sort -rn | head -15
-            echo ""
-            echo -e "${CYAN}${BOLD}Top 15 Client IPs:${NC}"
-            tail -n 5000 "$access_log" | awk '{print $1}' | sort | uniq -c | sort -rn | head -15
-            echo ""
-            echo -e "${CYAN}${BOLD}HTTP Methods:${NC}"
-            tail -n 5000 "$access_log" | awk -F'"' '{print $2}' | awk '{print $1}' | sort | uniq -c | sort -rn
-            press_enter
-            ;;
-        3)
-            print_header "ERROR & SUSPICIOUS REQUESTS"
-            echo -e "${CYAN}${BOLD}Top 10 4xx Endpoints:${NC}"
-            tail -n 5000 "$access_log" | awk '($9 ~ /^4/) {print $7}' | sort | uniq -c | sort -rn | head -10
-            echo ""
-            echo -e "${CYAN}${BOLD}Top 10 5xx Endpoints:${NC}"
-            tail -n 5000 "$access_log" | awk '($9 ~ /^5/) {print $7}' | sort | uniq -c | sort -rn | head -10
-            echo ""
-            echo -e "${CYAN}${BOLD}Suspicious Paths (scan patterns):${NC}"
-            tail -n 5000 "$access_log" | awk '($7 ~ /(wp-admin|wp-login|\.env|\.git|phpmyadmin|boaform|cgi-bin|vendor\/phpunit|HNAP1)/) {print $7}' | sort | uniq -c | sort -rn | head -15
-            echo ""
-            echo -e "${CYAN}${BOLD}Suspicious User Agents:${NC}"
-            tail -n 5000 "$access_log" | awk -F'"' '{print $6}' | grep -iE "bot|crawler|spider|scraper|scan|sqlmap|nmap" | sort | uniq -c | sort -rn | head -10 || true
-            press_enter
-            ;;
-        4)
-            print_header "LIVE REQUEST TAIL"
-            echo -e "${YELLOW}Press Ctrl+C to stop live view${NC}\n"
-            tail -n 30 -f "$access_log"
-            ;;
-        0) ;;
-        *)
-            print_status "ERROR" "Invalid option"
-            sleep 1
-            ;;
-    esac
-}
-
-log_insights_menu() {
-    local nginx_error php_log mysql_log laravel_log auth_log
-    nginx_error="$(find_first_existing_file /var/log/nginx/error.log /var/log/nginx/error.log.1)"
-    php_log="$(find_first_existing_file /var/log/php8.3-fpm.log /var/log/php8.2-fpm.log /var/log/php8.1-fpm.log /var/log/php7.4-fpm.log)"
-    mysql_log="$(find_first_existing_file /var/log/mysql/error.log /var/log/mariadb/mariadb.log /var/log/mysqld.log)"
-    laravel_log="/var/www/html/storage/logs/laravel-$(date +%Y-%m-%d).log"
-    auth_log="$(find_first_existing_file /var/log/auth.log /var/log/secure)"
-
-    print_header "LOG INSIGHTS CENTER"
-    echo -e "  ${BOLD}1${NC}) Nginx Errors (last 120)"
-    echo -e "  ${BOLD}2${NC}) PHP-FPM Errors (last 120)"
-    echo -e "  ${BOLD}3${NC}) Database Errors (last 120)"
-    echo -e "  ${BOLD}4${NC}) Laravel Errors Today (last 120)"
-    echo -e "  ${BOLD}5${NC}) Failed SSH Attempts (last 40)"
-    echo -e "  ${BOLD}0${NC}) Back"
-    echo ""
-    echo -ne "${YELLOW}Your choice: ${NC}"
-    read l_choice
-
-    case $l_choice in
-        1)
-            print_header "NGINX ERROR LOGS"
-            [ -n "${nginx_error:-}" ] && tail -n 600 "$nginx_error" | grep -iE "error|crit|alert|emerg" | tail -n 120 || print_status "WARN" "Nginx error log not found"
-            press_enter
-            ;;
-        2)
-            print_header "PHP-FPM ERROR LOGS"
-            [ -n "${php_log:-}" ] && tail -n 600 "$php_log" | grep -iE "error|warning|fatal|critical" | tail -n 120 || print_status "WARN" "PHP-FPM log not found"
-            press_enter
-            ;;
-        3)
-            print_header "DATABASE ERROR LOGS"
-            [ -n "${mysql_log:-}" ] && tail -n 600 "$mysql_log" | grep -iE "error|warning|critical|aborted" | tail -n 120 || print_status "WARN" "Database error log not found"
-            press_enter
-            ;;
-        4)
-            print_header "LARAVEL ERROR LOGS (TODAY)"
-            [ -f "$laravel_log" ] && tail -n 1000 "$laravel_log" | grep -iE "error|exception|fatal|critical" | tail -n 120 || print_status "WARN" "Laravel log not found for today"
-            press_enter
-            ;;
-        5)
-            print_header "FAILED SSH LOGIN ATTEMPTS"
-            [ -n "${auth_log:-}" ] && grep "Failed password" "$auth_log" | tail -n 40 || print_status "WARN" "Auth log not found"
-            press_enter
-            ;;
-        0) ;;
-        *)
-            print_status "ERROR" "Invalid option"
-            sleep 1
-            ;;
-    esac
-}
-
 launch_advanced_monitoring() {
     print_header "ADVANCED MONITORING"
 
@@ -1682,12 +1501,9 @@ service_log_menu() {
         
         echo ""
         echo -e "  ${BOLD}1${NC}) Nginx Management"
-        echo -e "  ${BOLD}2${NC}) Service Health Snapshot"
-        echo -e "  ${BOLD}3${NC}) Request Analytics (Nginx Access)"
-        echo -e "  ${BOLD}4${NC}) Log Insights Center"
-        echo -e "  ${BOLD}5${NC}) System Logs (journalctl)"
-        echo -e "  ${BOLD}6${NC}) Advanced Monitoring Dashboard"
-        echo -e "  ${BOLD}7${NC}) Clear All Service Logs"
+        echo -e "  ${BOLD}2${NC}) System Logs (journalctl)"
+        echo -e "  ${BOLD}3${NC}) Clear All Service Logs"
+        echo -e "  ${BOLD}4${NC}) Advanced Monitoring Dashboard"
         echo -e "  ${BOLD}0${NC}) Back"
         echo ""
         echo -ne "${YELLOW}Your choice: ${NC}"
@@ -1695,10 +1511,7 @@ service_log_menu() {
         
         case $choice in
             1) manage_nginx ;;
-            2) show_service_health_snapshot ;;
-            3) request_analytics_menu ;;
-            4) log_insights_menu ;;
-            5)
+            2)
                 print_header "SYSTEM LOGS"
                 echo -e "  ${BOLD}1${NC}) Last 100 system logs"
                 echo -e "  ${BOLD}2${NC}) System errors only"
@@ -1720,8 +1533,7 @@ service_log_menu() {
                         ;;
                 esac
                 ;;
-            6) launch_advanced_monitoring ;;
-            7)
+            3)
                 print_header "CLEAR ALL SERVICE LOGS"
                 echo -e "${YELLOW}⚠ This will clear ALL service logs and journal entries${NC}\n"
                 echo -ne "${RED}${BOLD}Are you sure?${NC} [y/N]: "
@@ -1741,6 +1553,7 @@ service_log_menu() {
                     press_enter
                 fi
                 ;;
+            4) launch_advanced_monitoring ;;
             0) break ;;
             *) print_status "ERROR" "Invalid option"; sleep 1 ;;
         esac
