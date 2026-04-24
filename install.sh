@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Server Tool - Quick Installation Script
-# Installs server main script + advanced monitor script
+# Installs the main server management script
 
 set -e
 
@@ -18,7 +18,6 @@ GITHUB_USER="miladrajabi2002"
 GITHUB_REPO="ServerManagement"
 GITHUB_BRANCH="main"
 SCRIPT_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}/server"
-MONITOR_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}/monitor.sh"
 
 echo -e "${CYAN}"
 cat << "EOF"
@@ -56,13 +55,6 @@ if [ -f "server" ]; then
     # Local installation
     echo -e "${GREEN}[OK]${NC} Found local server file"
     cp server /usr/local/bin/server
-
-    if [ -f "monitor.sh" ]; then
-        cp monitor.sh /usr/local/bin/server-monitor
-        echo -e "${GREEN}[OK]${NC} Found local monitor.sh"
-    else
-        echo -e "${YELLOW}[WARN]${NC} monitor.sh not found locally"
-    fi
 elif [ -n "$1" ]; then
     # Install from custom URL (server script only)
     echo -e "${YELLOW}Downloading from custom URL: $1${NC}"
@@ -84,23 +76,16 @@ else
         exit 1
     fi
 
-    if curl -fsSL "$MONITOR_URL" -o /usr/local/bin/server-monitor; then
-        echo -e "${GREEN}[OK]${NC} Downloaded monitor.sh successfully from GitHub"
-    else
-        echo -e "${YELLOW}[WARN]${NC} Could not download monitor.sh (server install will continue)"
-    fi
 fi
 
 # Make executable
 chmod +x /usr/local/bin/server
-[ -f /usr/local/bin/server-monitor ] && chmod +x /usr/local/bin/server-monitor
 
 echo -e "${GREEN}[OK]${NC} Installation completed successfully!\n"
 
 echo -e "${CYAN}-----------------------------------------------------------${NC}"
 echo -e "${GREEN}Server Management is now installed!${NC}\n"
 echo -e "Run with: ${YELLOW}sudo server${NC}"
-echo -e "Advanced monitor: ${YELLOW}sudo server-monitor snapshot${NC}\n"
 echo -e "${CYAN}-----------------------------------------------------------${NC}\n"
 
 # Ask if user wants to run it now

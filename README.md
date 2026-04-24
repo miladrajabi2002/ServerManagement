@@ -113,18 +113,14 @@ sudo server
 6. **Service & Log Management** - Nginx/system logs and service actions
 0. **Exit** - Close the tool
 
-### Advanced Monitoring Dashboard:
-From Service & Log Management, open **Advanced Monitoring Dashboard** for:
-- Snapshot report (one-time full report)
-- Live dashboard (continuous refresh)
-- Deep log analytics (precise Nginx/PHP/MariaDB/Laravel insights)
-
-You can also run it directly:
-```bash
-sudo server-monitor snapshot
-sudo server-monitor live
-sudo server-monitor logs
-```
+### Service & Log Management Dashboard:
+The **Service & Log Management** section now provides a unified one-page dashboard for:
+- Installed service checks (Nginx, Apache, PHP-FPM, DB, Redis/Dragonfly, Docker)
+- Automatic error digest from logs and journal
+- Nginx request intelligence (top URLs, high-rate IPs, 404 scans, suspicious user agents)
+- PHP-FPM worker count + capacity analysis
+- Database and cache quick health metrics
+- One-click reset for file logs + journal logs
 
 ## Requirements 📦
 

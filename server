@@ -22,6 +22,8 @@ NC='\033[0m'
 SCRIPT_VERSION="3.0.0"
 SYSCTL_CONF="/etc/sysctl.conf"
 BACKUP_DIR="/root/server-tool-backups"
+NGINX_ACCESS_LOG="/var/log/nginx/access.log"
+NGINX_ERROR_LOG="/var/log/nginx/error.log"
 
 # Create backup directory
 mkdir -p "$BACKUP_DIR"
@@ -164,13 +166,18 @@ show_system_info() {
     USED_DISK=$(df -h / | awk 'NR==2 {print $3}')
     DISK_PERCENT=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
     UPTIME=$(uptime -p 2>/dev/null || uptime | awk '{print $3,$4}' | tr -d ',')
-    PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "N/A")
+    PUBLIC_IPV4=$(curl -4 -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "N/A")
+    PUBLIC_IPV6=$(curl -6 -s --max-time 3 https://api64.ipify.org 2>/dev/null || echo "N/A")
     
     # Network info
     DNS_SERVERS=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ', ' | sed 's/,$//' || echo "N/A")
     MAIN_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
     MTU=$(ip link show $MAIN_INTERFACE 2>/dev/null | grep mtu | awk '{print $5}' || echo "N/A")
     RUNNING_PROCESSES=$(ps aux | wc -l)
+    IPV4_LIST=$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | paste -sd ', ' -)
+    IPV6_LIST=$(ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | paste -sd ', ' -)
+    [ -z "$IPV4_LIST" ] && IPV4_LIST="N/A"
+    [ -z "$IPV6_LIST" ] && IPV6_LIST="N/A"
     
     # Firewall
     if command -v ufw &> /dev/null; then
@@ -202,7 +209,10 @@ show_system_info() {
     printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} ${CYAN}%-34s${NC} ${BLUE}│${NC}\n" "Uptime" "${UPTIME:0:34}"
     printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} %-34s ${BLUE}│${NC}\n" "Processes" "$RUNNING_PROCESSES"
     echo -e "${BLUE}├─────────────────────────────────────────────────────────────┤${NC}"
-    printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} ${YELLOW}%-34s${NC} ${BLUE}│${NC}\n" "Public IP" "$PUBLIC_IP"
+    printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} ${YELLOW}%-34s${NC} ${BLUE}│${NC}\n" "Public IPv4" "${PUBLIC_IPV4:0:34}"
+    printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} ${YELLOW}%-34s${NC} ${BLUE}│${NC}\n" "Public IPv6" "${PUBLIC_IPV6:0:34}"
+    printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} %-34s ${BLUE}│${NC}\n" "Server IPv4(s)" "${IPV4_LIST:0:34}"
+    printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} %-34s ${BLUE}│${NC}\n" "Server IPv6(s)" "${IPV6_LIST:0:34}"
     printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} %-34s ${BLUE}│${NC}\n" "DNS Servers" "${DNS_SERVERS:0:34}"
     printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} %-34s ${BLUE}│${NC}\n" "MTU ($MAIN_INTERFACE)" "$MTU"
     printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} $FW_COLOR%-34s${NC} ${BLUE}│${NC}\n" "Firewall" "$FW_STATUS"
@@ -1348,212 +1358,346 @@ check_service_status() {
     fi
 }
 
-view_service_logs() {
-    local service=$1
-    local display_name=$2
-    local lines=${3:-50}
-    
-    print_header "$display_name LOGS"
-    
-    if systemctl list-units --full -all | grep -Fq "$service"; then
-        echo -e "${CYAN}${BOLD}Service Status:${NC}\n"
-        systemctl status "$service" --no-pager -l | head -15
-        echo ""
-        echo -e "${CYAN}${BOLD}Recent Logs:${NC}\n"
-        journalctl -u "$service" -n "$lines" --no-pager | tail -50
+service_exists() {
+    systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -Fxq "$1.service"
+}
+
+service_error_summary() {
+    local service="$1"
+    local logfile="$2"
+    local journal_err=""
+    local file_err=""
+
+    journal_err=$(journalctl -u "$service" -p err -n 1 --no-pager 2>/dev/null | tail -n 1)
+    if [ -n "$journal_err" ] && [[ "$journal_err" != *"-- No entries --"* ]]; then
+        echo "$journal_err"
+        return
+    fi
+
+    if [ -f "$logfile" ]; then
+        file_err=$(grep -iE "error|fail|critical|panic|emerg|alert" "$logfile" 2>/dev/null | tail -n 1)
+        [ -n "$file_err" ] && echo "$file_err"
+    fi
+}
+
+find_php_fpm_service() {
+    local php_service
+    php_service=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '/^php[0-9]+\.[0-9]+-fpm\.service/ {print $1}' | sed 's/\.service$//' | sort -Vr | head -n1)
+    echo "$php_service"
+}
+
+analyze_php_workers() {
+    local active_workers="$1"
+    local max_children="$2"
+
+    if [ -z "$max_children" ] || ! [[ "$max_children" =~ ^[0-9]+$ ]]; then
+        print_status "WARN" "Unable to detect pm.max_children from pool config"
+        return
+    fi
+
+    local usage=$((active_workers * 100 / max_children))
+    print_status "INFO" "Worker Capacity: $active_workers / $max_children (${usage}%)"
+
+    if [ "$active_workers" -gt "$max_children" ]; then
+        print_status "ERROR" "Worker count exceeds pm.max_children (tuning required)"
+    elif [ "$usage" -ge 85 ]; then
+        print_status "WARN" "Worker utilization is high (>=85%)"
     else
-        print_status "WARN" "$display_name is not installed"
+        print_status "SUCCESS" "Worker utilization is in normal range"
     fi
-    
-    press_enter
 }
 
-manage_nginx() {
-    while true; do
-        print_header "NGINX WEB SERVER MANAGEMENT"
-        
+print_installed_services_overview() {
+    local has_alerts=0
+    local apache_service=""
+    local mysql_service=""
+    local redis_service=""
+    local php_service=""
+
+    print_section "INSTALLED SERVICE STATUS"
+
+    if service_exists "nginx"; then
         check_service_status "nginx" "Nginx"
-        
-        echo ""
-        echo -e "  ${BOLD}1${NC}) 📄 View Access Logs"
-        echo -e "  ${BOLD}2${NC}) 🚨 View Error Logs"
-        echo -e "  ${BOLD}3${NC}) 🔄 Restart Nginx"
-        echo -e "  ${BOLD}4${NC}) ✅ Test Configuration"
-        echo -e "  ${BOLD}5${NC}) 📊 View Service Status"
-        echo -e "  ${BOLD}0${NC}) ← Back"
-        echo ""
-        echo -ne "${YELLOW}Your choice: ${NC}"
-        read choice
-        
-        case $choice in
-            1)
-                print_header "NGINX ACCESS LOGS"
-                if [ -f /var/log/nginx/access.log ]; then
-                    tail -50 /var/log/nginx/access.log
-                else
-                    print_status "WARN" "Access log not found"
-                fi
-                press_enter
-                ;;
-            2)
-                print_header "NGINX ERROR LOGS"
-                if [ -f /var/log/nginx/error.log ]; then
-                    tail -50 /var/log/nginx/error.log
-                    [ ! -s /var/log/nginx/error.log ] && echo -e "${GREEN}  ✓ No errors in log${NC}"
-                else
-                    print_status "WARN" "Error log not found"
-                fi
-                press_enter
-                ;;
-            3)
-                echo ""
-                nginx -t &>/dev/null
-                if [ $? -eq 0 ]; then
-                    systemctl restart nginx
-                    print_status "SUCCESS" "Nginx restarted successfully"
-                else
-                    print_status "ERROR" "Configuration test failed"
-                    nginx -t
-                fi
-                press_enter
-                ;;
-            4)
-                print_header "NGINX CONFIGURATION TEST"
-                nginx -t
-                press_enter
-                ;;
-            5)
-                view_service_logs "nginx" "Nginx"
-                ;;
-            0)
-                return
-                ;;
-            *)
-                print_status "ERROR" "Invalid choice"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-launch_advanced_monitoring() {
-    print_header "ADVANCED MONITORING"
-
-    local monitor_bin="/usr/local/bin/server-monitor"
-    if [ ! -x "$monitor_bin" ]; then
-        if [ -x "./monitor.sh" ]; then
-            monitor_bin="./monitor.sh"
-        elif [ -x "/usr/local/bin/monitor.sh" ]; then
-            monitor_bin="/usr/local/bin/monitor.sh"
-        else
-            print_status "WARN" "Advanced monitor is not installed"
-            echo -e "${CYAN}Re-run install.sh to install monitor.sh${NC}"
-            press_enter
-            return
-        fi
+        systemctl is-active --quiet nginx || has_alerts=1
+    else
+        echo -e "  ${DIM}○${NC} Nginx: ${DIM}Not installed${NC}"
     fi
 
-    while true; do
-        print_header "ADVANCED MONITORING"
-        echo -e "  ${BOLD}1${NC}) Snapshot Report"
-        echo -e "  ${BOLD}2${NC}) Live Dashboard"
-        echo -e "  ${BOLD}3${NC}) Deep Log Analytics"
-        echo -e "  ${BOLD}0${NC}) Back"
-        echo ""
-        echo -ne "${YELLOW}Your choice: ${NC}"
-        read mon_choice
+    if service_exists "apache2"; then
+        apache_service="apache2"
+        check_service_status "apache2" "Apache"
+    elif service_exists "httpd"; then
+        apache_service="httpd"
+        check_service_status "httpd" "Apache"
+    else
+        echo -e "  ${DIM}○${NC} Apache: ${DIM}Not installed${NC}"
+    fi
+    if [ -n "$apache_service" ] && ! systemctl is-active --quiet "$apache_service"; then
+        has_alerts=1
+    fi
 
-        case $mon_choice in
-            1) "$monitor_bin" snapshot ;;
-            2) "$monitor_bin" live ;;
-            3) "$monitor_bin" logs ;;
-            0) break ;;
-            *) print_status "ERROR" "Invalid option"; sleep 1 ;;
-        esac
-    done
+    php_service=$(find_php_fpm_service)
+    if [ -n "$php_service" ]; then
+        check_service_status "$php_service" "${php_service^^}"
+        systemctl is-active --quiet "$php_service" || has_alerts=1
+    else
+        echo -e "  ${DIM}○${NC} PHP-FPM: ${DIM}Not installed${NC}"
+    fi
+
+    if service_exists "mysql"; then
+        mysql_service="mysql"
+        check_service_status "mysql" "MySQL"
+    elif service_exists "mariadb"; then
+        mysql_service="mariadb"
+        check_service_status "mariadb" "MariaDB"
+    else
+        echo -e "  ${DIM}○${NC} MySQL/MariaDB: ${DIM}Not installed${NC}"
+    fi
+    if [ -n "$mysql_service" ] && ! systemctl is-active --quiet "$mysql_service"; then
+        has_alerts=1
+    fi
+
+    if service_exists "dragonfly"; then
+        redis_service="dragonfly"
+        check_service_status "dragonfly" "Dragonfly"
+    elif service_exists "redis-server"; then
+        redis_service="redis-server"
+        check_service_status "redis-server" "Redis"
+    elif service_exists "redis"; then
+        redis_service="redis"
+        check_service_status "redis" "Redis"
+    else
+        echo -e "  ${DIM}○${NC} Redis/Dragonfly: ${DIM}Not installed${NC}"
+    fi
+    if [ -n "$redis_service" ] && ! systemctl is-active --quiet "$redis_service"; then
+        has_alerts=1
+    fi
+
+    check_service_status "docker" "Docker"
+
+    return "$has_alerts"
 }
+
+show_nginx_section() {
+    print_section "NGINX ANALYTICS"
+    if ! service_exists "nginx"; then
+        print_status "WARN" "Nginx is not installed"
+        return
+    fi
+
+    systemctl status nginx --no-pager | head -n 5
+    print_status "INFO" "Active Connections: $(ss -tn 2>/dev/null | grep -E ':80|:443' | wc -l)"
+
+    echo -e "\n${CYAN}${BOLD}Top 5 Requested URLs:${NC}"
+    awk '{print $7}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
+
+    echo -e "\n${CYAN}${BOLD}Top 5 IPs Requesting (/):${NC}"
+    awk '($7 == "/") {print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
+
+    echo -e "\n${CYAN}${BOLD}High Request Rate IPs - Top 10:${NC}"
+    awk '{print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 10
+
+    echo -e "\n${CYAN}${BOLD}404 Errors - Top 10:${NC}"
+    awk '($9 == "404") {print $7}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 10
+
+    echo -e "\n${CYAN}${BOLD}Suspicious User Agents:${NC}"
+    awk -F'"' '{print $6}' "$NGINX_ACCESS_LOG" 2>/dev/null | grep -iE "bot|crawler|spider|scraper|scan" | sort | uniq -c | sort -rn | head -n 10
+
+    local nginx_err
+    nginx_err=$(service_error_summary "nginx" "$NGINX_ERROR_LOG")
+    if [ -n "$nginx_err" ]; then
+        print_status "ERROR" "Nginx alert: $nginx_err"
+    else
+        print_status "SUCCESS" "No critical nginx errors found in recent checks"
+    fi
+}
+
+show_php_section() {
+    print_section "PHP-FPM ANALYTICS"
+    local php_service
+    php_service=$(find_php_fpm_service)
+    if [ -z "$php_service" ]; then
+        print_status "WARN" "PHP-FPM is not installed"
+        return
+    fi
+
+    systemctl status "$php_service" --no-pager | head -n 5
+    local workers
+    workers=$(ps aux | grep php-fpm | grep -v grep | wc -l)
+    print_status "INFO" "Active Workers: $workers"
+
+    local php_version pool_conf max_children php_err
+    php_version=$(echo "$php_service" | sed -E 's/php([0-9]+\.[0-9]+)-fpm/\1/')
+    pool_conf="/etc/php/${php_version}/fpm/pool.d/www.conf"
+    max_children=$(awk -F'=' '/^[[:space:]]*pm.max_children/ {gsub(/[[:space:]]*/, "", $2); print $2; exit}' "$pool_conf" 2>/dev/null)
+    analyze_php_workers "$workers" "$max_children"
+
+    php_err=$(service_error_summary "$php_service" "/var/log/php${php_version}-fpm.log")
+    if [ -n "$php_err" ]; then
+        print_status "ERROR" "PHP-FPM alert: $php_err"
+    else
+        print_status "SUCCESS" "No critical PHP-FPM errors found in recent checks"
+    fi
+}
+
+show_database_section() {
+    print_section "DATABASE ANALYTICS"
+    local db_service=""
+    if service_exists "mysql"; then
+        db_service="mysql"
+    elif service_exists "mariadb"; then
+        db_service="mariadb"
+    fi
+
+    if [ -z "$db_service" ]; then
+        print_status "WARN" "MySQL/MariaDB is not installed"
+        return
+    fi
+
+    systemctl status "$db_service" --no-pager | head -n 5
+    echo ""
+    mysql -e "
+SELECT
+    (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER='v2board') AS active_connections,
+    (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER='v2board' AND COMMAND='Sleep') AS sleeping_connections,
+    (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='Aborted_clients') AS aborted_clients,
+    (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='Connections') AS total_connections;
+" 2>/dev/null || print_status "WARN" "MariaDB query failed"
+
+    local db_err
+    db_err=$(service_error_summary "$db_service" "/var/log/mysql/error.log")
+    if [ -n "$db_err" ]; then
+        print_status "ERROR" "Database alert: $db_err"
+    else
+        print_status "SUCCESS" "No critical database errors found in recent checks"
+    fi
+}
+
+show_cache_section() {
+    print_section "REDIS / DRAGONFLY ANALYTICS"
+    local cache_service=""
+    if service_exists "dragonfly"; then
+        cache_service="dragonfly"
+    elif service_exists "redis-server"; then
+        cache_service="redis-server"
+    elif service_exists "redis"; then
+        cache_service="redis"
+    fi
+
+    if [ -z "$cache_service" ]; then
+        print_status "WARN" "Redis/Dragonfly is not installed"
+        return
+    fi
+
+    systemctl status "$cache_service" --no-pager | head -n 5
+    redis-cli info memory 2>/dev/null | grep -E "used_memory_human|maxmemory_human" || print_status "WARN" "Unable to fetch redis memory details"
+    print_status "INFO" "Connected Clients: $(redis-cli CLIENT LIST 2>/dev/null | wc -l)"
+    redis-cli INFO stats 2>/dev/null | grep instantaneous_ops || true
+
+    local cache_err
+    cache_err=$(service_error_summary "$cache_service" "/var/log/redis/redis-server.log")
+    if [ -n "$cache_err" ]; then
+        print_status "ERROR" "Redis/Dragonfly alert: $cache_err"
+    else
+        print_status "SUCCESS" "No critical cache errors found in recent checks"
+    fi
+}
+
+show_apache_section() {
+    print_section "APACHE ANALYTICS"
+    local apache_service=""
+    local apache_error_log="/var/log/apache2/error.log"
+
+    if service_exists "apache2"; then
+        apache_service="apache2"
+    elif service_exists "httpd"; then
+        apache_service="httpd"
+        apache_error_log="/var/log/httpd/error_log"
+    fi
+
+    if [ -z "$apache_service" ]; then
+        print_status "WARN" "Apache is not installed"
+        return
+    fi
+
+    systemctl status "$apache_service" --no-pager | head -n 5
+    if [ -f "$apache_error_log" ]; then
+        print_status "INFO" "Latest Apache errors:"
+        tail -n 5 "$apache_error_log"
+    fi
+
+    local apache_err
+    apache_err=$(service_error_summary "$apache_service" "$apache_error_log")
+    if [ -n "$apache_err" ]; then
+        print_status "ERROR" "Apache alert: $apache_err"
+    else
+        print_status "SUCCESS" "No critical Apache errors found in recent checks"
+    fi
+}
+
+show_general_error_digest() {
+    print_section "GLOBAL ERROR DIGEST"
+    print_status "INFO" "Latest system errors (journalctl -p err -n 15):"
+    journalctl -p err -n 15 --no-pager 2>/dev/null
+}
+
+reset_all_logs() {
+    print_header "RESET ALL LOG FILES + JOURNAL"
+    echo -e "${YELLOW}⚠ This will truncate most logs under /var/log and rotate/vacuum journal${NC}"
+    echo -ne "${RED}${BOLD}Continue?${NC} [y/N]: "
+    read confirm
+
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        print_status "INFO" "Log reset cancelled"
+        return
+    fi
+
+    journalctl --rotate 2>/dev/null
+    journalctl --vacuum-time=1s >/dev/null 2>&1
+    find /var/log -type f \( -name "*.log" -o -name "syslog" -o -name "messages" -o -name "auth.log" -o -name "kern.log" \) -exec truncate -s 0 {} + 2>/dev/null
+    sync
+    print_status "SUCCESS" "Logs and journal entries were reset"
+}
+
+render_service_log_dashboard() {
+    local overview_alert=0
+    print_header "SERVICE & LOG MANAGEMENT - UNIFIED DASHBOARD"
+
+    print_installed_services_overview
+    overview_alert=$?
+    if [ "$overview_alert" -ne 0 ]; then
+        echo ""
+        print_status "ERROR" "One or more installed services are stopped. Review sections below."
+    fi
+
+    show_nginx_section
+    show_php_section
+    show_database_section
+    show_cache_section
+    show_apache_section
+    show_general_error_digest
+}
+
 service_log_menu() {
     while true; do
         print_banner
         show_system_info
-        print_header "SERVICE & LOG MANAGEMENT"
-        
-        echo -e "${CYAN}${BOLD}Service Status Overview:${NC}\n"
-        
-        # Check services
-        check_service_status "nginx" "Nginx"
-        check_service_status "apache2" "Apache" || check_service_status "httpd" "Apache"
-        
-        # PHP-FPM
-        local php_found=0
-        for ver in 8.4 8.3 8.2 8.1 8.0 7.4; do
-            if systemctl list-units --full -all | grep -Fq "php${ver}-fpm"; then
-                check_service_status "php${ver}-fpm" "PHP ${ver}-FPM"
-                php_found=1
-                break
-            fi
-        done
-        [ $php_found -eq 0 ] && echo -e "  ${DIM}○${NC} PHP-FPM: ${DIM}Not installed${NC}"
-        
-        check_service_status "mysql" "MySQL" || check_service_status "mariadb" "MariaDB"
-        check_service_status "redis-server" "Redis" || check_service_status "redis" "Redis"
-        check_service_status "docker" "Docker"
-        
-        echo ""
-        echo -e "  ${BOLD}1${NC}) Nginx Management"
-        echo -e "  ${BOLD}2${NC}) System Logs (journalctl)"
-        echo -e "  ${BOLD}3${NC}) Clear All Service Logs"
-        echo -e "  ${BOLD}4${NC}) Advanced Monitoring Dashboard"
-        echo -e "  ${BOLD}0${NC}) Back"
+        render_service_log_dashboard
+
+        echo -e "\n${CYAN}${BOLD}Dashboard Controls:${NC}"
+        echo -e "  ${BOLD}1${NC}) 🔄 Refresh unified dashboard"
+        echo -e "  ${BOLD}2${NC}) 🧹 Reset all logs (files + journal)"
+        echo -e "  ${BOLD}0${NC}) ← Back"
         echo ""
         echo -ne "${YELLOW}Your choice: ${NC}"
         read choice
-        
+
         case $choice in
-            1) manage_nginx ;;
+            1) continue ;;
             2)
-                print_header "SYSTEM LOGS"
-                echo -e "  ${BOLD}1${NC}) Last 100 system logs"
-                echo -e "  ${BOLD}2${NC}) System errors only"
-                echo -e "  ${BOLD}0${NC}) Back"
-                echo ""
-                echo -ne "${YELLOW}Your choice: ${NC}"
-                read log_choice
-                
-                case $log_choice in
-                    1)
-                        print_header "LAST 100 SYSTEM LOGS"
-                        journalctl -n 100 --no-pager
-                        press_enter
-                        ;;
-                    2)
-                        print_header "SYSTEM ERRORS"
-                        journalctl -p err -n 50 --no-pager
-                        press_enter
-                        ;;
-                esac
+                reset_all_logs
+                press_enter
                 ;;
-            3)
-                print_header "CLEAR ALL SERVICE LOGS"
-                echo -e "${YELLOW}⚠ This will clear ALL service logs and journal entries${NC}\n"
-                echo -ne "${RED}${BOLD}Are you sure?${NC} [y/N]: "
-                read confirm
-                
-                if [[ $confirm =~ ^[Yy]$ ]]; then
-                    echo ""
-                    journalctl --rotate 2>/dev/null
-                    journalctl --vacuum-time=1s >/dev/null 2>&1
-                    
-                    for log_file in /var/log/nginx/*.log /var/log/apache2/*.log; do
-                        [ -f "$log_file" ] && > "$log_file" 2>/dev/null
-                    done
-                    
-                    sync
-                    print_status "SUCCESS" "All logs cleared"
-                    press_enter
-                fi
-                ;;
-            4) launch_advanced_monitoring ;;
             0) break ;;
             *) print_status "ERROR" "Invalid option"; sleep 1 ;;
         esac
@@ -1817,15 +1961,15 @@ main_menu() {
         show_system_info
         
         echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${CYAN}${BOLD}  MAIN MENU${NC}"
+        echo -e "${CYAN}${BOLD}  MAIN MENU · PROFESSIONAL CONTROL CENTER${NC}"
         echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
-        
-        echo -e "  ${BOLD}1${NC}) 🌐 Network & Server Optimization"
-        echo -e "  ${BOLD}2${NC}) 🔍 IP Reputation & Security Check"
-        echo -e "  ${BOLD}3${NC}) 🔄 Optimize Repository Mirrors"
+
+        echo -e "  ${BOLD}1${NC}) 🌐 Network & Server Optimization ${DIM}(BBR/MTU/DNS/Ping)${NC}"
+        echo -e "  ${BOLD}2${NC}) 🔍 IP Reputation & Security Check ${DIM}(Fraud/Blacklist/Leak)${NC}"
+        echo -e "  ${BOLD}3${NC}) 🔄 Optimize Repository Mirrors ${DIM}(APT speed tuning)${NC}"
         echo -e "  ${BOLD}4${NC}) 📊 Live Server Monitoring ${GREEN}${BOLD}[BTOP]${NC}"
-        echo -e "  ${BOLD}5${NC}) ⚡ System Benchmark"
-        echo -e "  ${BOLD}6${NC}) 🔧 Service & Log Management"
+        echo -e "  ${BOLD}5${NC}) ⚡ System Benchmark ${DIM}(Bench.sh quick run)${NC}"
+        echo -e "  ${BOLD}6${NC}) 🔧 Service & Log Management ${DIM}(Unified dashboard)${NC}"
         echo -e "  ${BOLD}0${NC}) ❌ Exit"
         
         echo -e "\n${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
