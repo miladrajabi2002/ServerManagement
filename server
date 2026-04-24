@@ -27,6 +27,8 @@ NGINX_ERROR_LOG="/var/log/nginx/error.log"
 STATE_DIR="/var/lib/server-management"
 LOG_PIPELINE_FILE="/tmp/server-log-pipeline.ndjson"
 DRIFT_BASELINE_FILE="$STATE_DIR/runtime-baseline.txt"
+CPU_PEG_THRESHOLD="${CPU_PEG_THRESHOLD:-90}"
+MEM_HIGH_THRESHOLD="${MEM_HIGH_THRESHOLD:-20}"
 
 # Create backup directory
 mkdir -p "$BACKUP_DIR"
@@ -1424,13 +1426,12 @@ analyze_php_workers() {
 print_installed_services_overview() {
     local has_alerts=0
     local apache_service=""
-    local mysql_service=""
     local redis_service=""
     local php_service=""
 
     print_section "INSTALLED SERVICE STATUS"
     print_breadcrumb "Service & Log Management > Services > Installed Status"
-    print_context_help "وضعیت سرویس‌های نصب‌شده به‌همراه نمایش Running/Stopped."
+    print_context_help "Installed services status with explicit Running/Stopped state."
 
     if service_exists "nginx"; then
         check_service_status "nginx" "Nginx"
@@ -1460,17 +1461,21 @@ print_installed_services_overview() {
         echo -e "  ${DIM}○${NC} PHP-FPM: ${DIM}Not installed${NC}"
     fi
 
-    if service_exists "mysql"; then
-        mysql_service="mysql"
-        check_service_status "mysql" "MySQL"
-    elif service_exists "mariadb"; then
-        mysql_service="mariadb"
-        check_service_status "mariadb" "MariaDB"
+    local db_services=()
+    service_exists "mysql" && db_services+=("mysql")
+    service_exists "mariadb" && db_services+=("mariadb")
+    if [ "${#db_services[@]}" -gt 0 ]; then
+        local db_svc
+        for db_svc in "${db_services[@]}"; do
+            if [ "$db_svc" = "mysql" ]; then
+                check_service_status "mysql" "MySQL"
+            else
+                check_service_status "mariadb" "MariaDB"
+            fi
+            systemctl is-active --quiet "$db_svc" || has_alerts=1
+        done
     else
         echo -e "  ${DIM}○${NC} MySQL/MariaDB: ${DIM}Not installed${NC}"
-    fi
-    if [ -n "$mysql_service" ] && ! systemctl is-active --quiet "$mysql_service"; then
-        has_alerts=1
     fi
 
     if service_exists "dragonfly"; then
@@ -1490,6 +1495,21 @@ print_installed_services_overview() {
     fi
 
     check_service_status "docker" "Docker"
+    check_service_status "ufw" "UFW Firewall"
+    check_service_status "pm2-root" "PM2 (root)"
+    check_service_status "pm2" "PM2"
+
+    if command -v node >/dev/null 2>&1; then
+        print_status "INFO" "Node.js: $(node --version 2>/dev/null)"
+    else
+        echo -e "  ${DIM}○${NC} Node.js: ${DIM}Not installed${NC}"
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        print_status "INFO" "Python3: $(python3 --version 2>/dev/null)"
+    else
+        echo -e "  ${DIM}○${NC} Python3: ${DIM}Not installed${NC}"
+    fi
 
     return "$has_alerts"
 }
@@ -1497,7 +1517,7 @@ print_installed_services_overview() {
 show_nginx_section() {
     print_section "NGINX ANALYTICS"
     print_breadcrumb "Service & Log Management > Services > Nginx"
-    print_context_help "ترافیک، URLهای پرتکرار، 404 و User-Agent مشکوک برای Nginx."
+    print_context_help "Traffic, top URLs, 404 patterns, and suspicious user-agents for Nginx."
     if ! service_exists "nginx"; then
         print_status "WARN" "Nginx is not installed"
         return
@@ -1510,10 +1530,11 @@ show_nginx_section() {
     awk '{print $7}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
 
     echo -e "\n${CYAN}${BOLD}Top 5 IPs Requesting (/):${NC}"
+    echo -e "${DIM}  Clients repeatedly hitting the root path (/). Useful to spot load balancers, bots, or floods.${NC}"
     awk '($7 == "/") {print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
 
-    echo -e "\n${CYAN}${BOLD}High Request Rate IPs - Top 10:${NC}"
-    awk '{print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 10
+    echo -e "\n${CYAN}${BOLD}High Request Rate IPs - Top 5:${NC}"
+    awk '{print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
 
     echo -e "\n${CYAN}${BOLD}404 Errors - Top 10:${NC}"
     awk '($9 == "404") {print $7}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 10
@@ -1527,13 +1548,14 @@ show_nginx_section() {
         print_status "ERROR" "Nginx alert: $nginx_err"
     else
         print_status "SUCCESS" "No critical nginx errors found in recent checks"
+        echo ""
     fi
 }
 
 show_php_section() {
     print_section "PHP-FPM ANALYTICS"
     print_breadcrumb "Service & Log Management > Services > PHP-FPM"
-    print_context_help "وضعیت سرویس، تعداد worker و ظرفیت pm.max_children."
+    print_context_help "Service status, active worker count, and pm.max_children capacity."
     local php_service
     php_service=$(find_php_fpm_service)
     if [ -z "$php_service" ]; then
@@ -1542,6 +1564,7 @@ show_php_section() {
     fi
 
     systemctl status "$php_service" --no-pager | head -n 5
+    echo ""
     local workers
     workers=$(ps aux | grep php-fpm | grep -v grep | wc -l)
     print_status "INFO" "Active Workers: $workers"
@@ -1563,42 +1586,47 @@ show_php_section() {
 show_database_section() {
     print_section "DATABASE ANALYTICS"
     print_breadcrumb "Service & Log Management > Services > Database"
-    print_context_help "اتصال‌های فعال/خوابیده و خطاهای مهم MySQL/MariaDB."
-    local db_service=""
-    if service_exists "mysql"; then
-        db_service="mysql"
-    elif service_exists "mariadb"; then
-        db_service="mariadb"
-    fi
+    print_context_help "Active/sleeping connections and critical MySQL/MariaDB errors."
+    local db_services=()
+    service_exists "mysql" && db_services+=("mysql")
+    service_exists "mariadb" && db_services+=("mariadb")
+    local db_count="${#db_services[@]}"
 
-    if [ -z "$db_service" ]; then
+    if [ "$db_count" -eq 0 ]; then
         print_status "WARN" "MySQL/MariaDB is not installed"
         return
     fi
 
-    systemctl status "$db_service" --no-pager | head -n 5
-    echo ""
+    local db_service
+    for db_service in "${db_services[@]}"; do
+        print_status "INFO" "Detected database service: $db_service"
+        systemctl status "$db_service" --no-pager | head -n 5
+        echo ""
+    done
+
     mysql -e "
 SELECT
     (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER='v2board') AS active_connections,
     (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER='v2board' AND COMMAND='Sleep') AS sleeping_connections,
     (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='Aborted_clients') AS aborted_clients,
     (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='Connections') AS total_connections;
-" 2>/dev/null || print_status "WARN" "MariaDB query failed"
+" 2>/dev/null || print_status "WARN" "Database query failed (mysql client or credentials unavailable)"
 
-    local db_err
-    db_err=$(service_error_summary "$db_service" "/var/log/mysql/error.log")
-    if [ -n "$db_err" ]; then
-        print_status "ERROR" "Database alert: $db_err"
-    else
-        print_status "SUCCESS" "No critical database errors found in recent checks"
-    fi
+    local db_err db_alert=0
+    for db_service in "${db_services[@]}"; do
+        db_err=$(service_error_summary "$db_service" "/var/log/mysql/error.log")
+        if [ -n "$db_err" ]; then
+            db_alert=1
+            print_status "ERROR" "Database alert ($db_service): $db_err"
+        fi
+    done
+    [ "$db_alert" -eq 0 ] && print_status "SUCCESS" "No critical database errors found in recent checks"
 }
 
 show_cache_section() {
     print_section "REDIS / DRAGONFLY ANALYTICS"
     print_breadcrumb "Service & Log Management > Services > Cache"
-    print_context_help "memory, client count و هشدارهای Redis/Dragonfly."
+    print_context_help "Memory usage, client count, and warning/error signals for Redis/Dragonfly."
     local cache_service=""
     if service_exists "dragonfly"; then
         cache_service="dragonfly"
@@ -1614,6 +1642,7 @@ show_cache_section() {
     fi
 
     systemctl status "$cache_service" --no-pager | head -n 5
+    echo ""
     redis-cli info memory 2>/dev/null | grep -E "used_memory_human|maxmemory_human" || print_status "WARN" "Unable to fetch redis memory details"
     print_status "INFO" "Connected Clients: $(redis-cli CLIENT LIST 2>/dev/null | wc -l)"
     redis-cli INFO stats 2>/dev/null | grep instantaneous_ops || true
@@ -1630,7 +1659,7 @@ show_cache_section() {
 show_apache_section() {
     print_section "APACHE ANALYTICS"
     print_breadcrumb "Service & Log Management > Services > Apache"
-    print_context_help "وضعیت Apache و آخرین خطاهای مهم."
+    print_context_help "Apache status and latest critical errors."
     local apache_service=""
     local apache_error_log="/var/log/apache2/error.log"
 
@@ -1661,10 +1690,92 @@ show_apache_section() {
     fi
 }
 
+show_nodejs_section() {
+    print_section "NODE.JS ANALYTICS"
+    print_breadcrumb "Service & Log Management > Services > Node.js"
+    print_context_help "Node.js runtime version, PM2/systemd process state, and recent error signals."
+
+    if command -v node >/dev/null 2>&1; then
+        print_status "INFO" "Node.js Version: $(node --version 2>/dev/null)"
+    else
+        print_status "WARN" "Node.js is not installed"
+        return
+    fi
+
+    if command -v pm2 >/dev/null 2>&1; then
+        print_status "INFO" "PM2 Process List:"
+        pm2 list --no-color 2>/dev/null | head -n 20
+        echo ""
+        print_status "INFO" "Recent PM2 logs (last 10 lines):"
+        pm2 logs --nostream --lines 10 2>/dev/null | tail -n 10
+    else
+        print_status "INFO" "PM2 not found, checking systemd node services"
+        systemctl list-units --type=service --state=running --no-legend 2>/dev/null | grep -Ei 'node|npm|yarn' | head -n 10 | sed 's/^/  - /' || true
+    fi
+}
+
+show_python_section() {
+    print_section "PYTHON ANALYTICS"
+    print_breadcrumb "Service & Log Management > Services > Python"
+    print_context_help "Python runtime version and active python-based services/processes."
+
+    if command -v python3 >/dev/null 2>&1; then
+        print_status "INFO" "Python Version: $(python3 --version 2>/dev/null)"
+    else
+        print_status "WARN" "Python3 is not installed"
+        return
+    fi
+
+    echo -e "${CYAN}${BOLD}  Top Python processes:${NC}"
+    ps -eo pid=,user=,%cpu=,%mem=,comm=,args= --sort=-%cpu 2>/dev/null \
+        | awk '/python/ {printf "  %-8s %-12s CPU=%-6s MEM=%-6s %-14s %s\n",$1,$2,$3"%",$4"%",$5,substr($0,index($0,$6))}' \
+        | head -n 10
+
+    local py_err
+    py_err=$(journalctl -p err -n 200 --no-pager 2>/dev/null | grep -i "python" | tail -n 1)
+    if [ -n "$py_err" ]; then
+        print_status "WARN" "Recent Python-related error: $py_err"
+    else
+        print_status "SUCCESS" "No recent Python-related critical errors found"
+    fi
+}
+
+show_ufw_section() {
+    print_section "UFW FIREWALL ANALYTICS"
+    print_breadcrumb "Service & Log Management > Services > UFW"
+    print_context_help "UFW state, active rules summary, and recent deny events."
+
+    if ! command -v ufw >/dev/null 2>&1; then
+        print_status "WARN" "UFW is not installed"
+        return
+    fi
+
+    ufw status verbose 2>/dev/null | head -n 20
+    echo ""
+    print_status "INFO" "Recent UFW deny logs (last 10):"
+    (journalctl -u ufw --no-pager -n 200 2>/dev/null | grep -i "deny" | tail -n 10) || true
+}
+
+show_pm2_section() {
+    print_section "PM2 ANALYTICS"
+    print_breadcrumb "Service & Log Management > Services > PM2"
+    print_context_help "PM2 daemon status, managed apps, restart counters, and recent errors."
+
+    if ! command -v pm2 >/dev/null 2>&1; then
+        print_status "WARN" "PM2 is not installed"
+        return
+    fi
+
+    pm2 ping 2>/dev/null | head -n 2
+    pm2 jlist 2>/dev/null | awk -F'"' '/"name":/ {name=$4} /"restart_time":/ {gsub(/[^0-9]/,"",$0); if(length($0)>0) print "  - "name" restart_count=" $0}' | head -n 10
+    print_status "INFO" "Recent PM2 error log lines:"
+    pm2 logs --err --nostream --lines 10 2>/dev/null | tail -n 10
+}
+
 show_general_error_digest() {
     print_section "GLOBAL ERROR DIGEST"
     print_breadcrumb "Service & Log Management > Logs > Global Digest"
-    print_context_help "نمایش 15 خطای آخر سیستم. برای بازه زمانی از منوی لاگ حرفه‌ای استفاده کنید."
+    print_context_help "Shows the latest 15 system errors. Use Advanced Log tools for time windows."
     print_status "INFO" "Latest system errors (journalctl -p err -n 15):"
     journalctl -p err -n 15 --no-pager 2>/dev/null
 }
@@ -1698,7 +1809,7 @@ normalize_log_line() {
 build_unified_log_pipeline() {
     print_section "UNIFIED LOG PIPELINE"
     print_breadcrumb "Service & Log Management > Logs > Pipeline"
-    print_context_help "لاگ journald و فایل‌ها در فرمت NDJSON نرمال می‌شوند."
+    print_context_help "Journald and log files are normalized into NDJSON records."
 
     : > "$LOG_PIPELINE_FILE"
 
@@ -1754,7 +1865,7 @@ show_smart_error_digest() {
 show_log_anomaly_detection() {
     print_section "LOG ANOMALY DETECTION"
     print_breadcrumb "Service & Log Management > Logs > Anomaly Detection"
-    print_context_help "مقایسه خطاهای 15 دقیقه اخیر با 15 دقیقه قبل برای تشخیص جهش ناگهانی."
+    print_context_help "Compares recent 15-minute errors vs previous 15 minutes to detect spikes."
 
     local recent previous new_patterns
     recent=$(journalctl --since "15 min ago" -p err --no-pager 2>/dev/null | wc -l)
@@ -1781,7 +1892,7 @@ show_log_anomaly_detection() {
 show_software_inventory() {
     print_section "SOFTWARE INVENTORY"
     print_breadcrumb "Service & Log Management > Runtime Audit > Installed Software"
-    print_context_help "نمایش نسخه، منبع نصب و قابلیت مقایسه بین سرورها (خروجی متنی)."
+    print_context_help "Shows package version/source and supports text-based server comparison."
 
     if command -v dpkg-query >/dev/null 2>&1; then
         print_status "INFO" "Detected package manager: apt/dpkg"
@@ -1797,10 +1908,14 @@ show_software_inventory() {
 show_startup_autorun_audit() {
     print_section "STARTUP & AUTORUN AUDIT"
     print_breadcrumb "Service & Log Management > Runtime Audit > Auto-start"
-    print_context_help "شناسایی سرویس‌ها/کران‌جاب‌های auto-start و موارد مشکوک."
+    print_context_help "Detects auto-start services/cron jobs while reducing system-noise units."
 
-    print_status "INFO" "Enabled systemd services (top 20):"
-    systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | head -n 20 | awk '{print "  - "$1}'
+    print_status "INFO" "Enabled non-systemd-essential services (top 25):"
+    systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null \
+        | awk '{print $1}' \
+        | grep -Ev '^(systemd-|dbus\.service|getty@|serial-getty@|apt-daily|apt-daily-upgrade|fstrim|snapd|systemd-timesyncd|user@|console-setup|networkd-dispatcher)' \
+        | head -n 25 \
+        | awk '{print "  - "$1}'
 
     echo -e "\n${CYAN}${BOLD}  @reboot cron entries:${NC}"
     (crontab -l 2>/dev/null | grep -i '@reboot' || true) | sed 's/^/  - /'
@@ -1812,10 +1927,14 @@ show_startup_autorun_audit() {
 show_runtime_execution_map() {
     print_section "RUNTIME EXECUTION MAP"
     print_breadcrumb "Service & Log Management > Runtime Audit > Running Items"
-    print_context_help "نمایش سرویس‌های فعال و پردازش‌های detached/کانتینرها."
+    print_context_help "Shows active services plus detached processes/containers in aligned two-column output."
 
     print_status "INFO" "Active services count: $(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | wc -l)"
-    systemctl list-units --type=service --state=running --no-legend 2>/dev/null | head -n 12 | awk '{print "  - "$1}'
+    printf "${BOLD}  %-38s %-30s${NC}\n" "RUNNING SERVICE" "STATE"
+    echo "  --------------------------------------------------------------------------"
+    systemctl list-units --type=service --state=running --no-legend 2>/dev/null \
+        | awk '{printf "  %-38s %-30s\n",$1,$4}' \
+        | head -n 30
 
     echo -e "\n${CYAN}${BOLD}  Top detached processes:${NC}"
     ps -eo pid,ppid,user,%cpu,%mem,comm --sort=-%cpu | awk '$2==1 {printf "  - PID:%s USER:%s CPU:%s MEM:%s CMD:%s\n",$1,$3,$4,$5,$6}' | head -n 10
@@ -1829,13 +1948,13 @@ show_runtime_execution_map() {
 show_drift_detection() {
     print_section "DRIFT DETECTION"
     print_breadcrumb "Service & Log Management > Runtime Audit > Drift Detection"
-    print_context_help "مقایسه وضعیت فعلی اجرا با baseline مرجع."
+    print_context_help "Compares current runtime items with a baseline snapshot."
 
     local current_file
     current_file=$(mktemp)
     {
         systemctl list-unit-files --type=service --state=enabled --no-legend 2>/dev/null | awk '{print "svc:"$1}'
-        ps -eo comm= 2>/dev/null | sort -u | head -n 300 | awk '{print "proc:"$1}'
+        ps -eo comm= 2>/dev/null | grep -Ev '^kworker' | sort -u | head -n 300 | awk '{print "proc:"$1}'
     } | sort -u > "$current_file"
 
     if [ ! -f "$DRIFT_BASELINE_FILE" ]; then
@@ -1862,7 +1981,7 @@ show_drift_detection() {
 show_process_intelligence() {
     print_section "PROCESS INTELLIGENCE DASHBOARD"
     print_breadcrumb "Service & Log Management > Processes > Intelligence"
-    print_context_help "نمایش top مصرف CPU/RAM/IO به همراه user و uptime."
+    print_context_help "Top CPU/RAM/IO consumers with user and uptime."
 
     echo -e "${CYAN}${BOLD}  Top CPU processes:${NC}"
     ps -eo pid,user,%cpu,%mem,etime,comm,args --sort=-%cpu | head -n 8 | awk '{printf "  PID:%-7s USER:%-10s CPU:%-6s MEM:%-6s UPTIME:%-10s CMD:%s\n",$1,$2,$3,$4,$5,$6}'
@@ -1873,13 +1992,30 @@ show_process_intelligence() {
 show_duplicate_process_detection() {
     print_section "DUPLICATE PROCESS DETECTION"
     print_breadcrumb "Service & Log Management > Processes > Duplicates"
-    print_context_help "شناسایی پردازش‌های تکراری بر اساس binary/args/parent tree."
+    print_context_help "Detect duplicate workloads based on binary/args/parent tree."
 
     local duplicates
-    duplicates=$(ps -eo ppid=,comm=,args= 2>/dev/null | awk '{key=$2"|"substr($0,index($0,$3)); c[key]++; if(!sample[key]) sample[key]=$0} END {for (k in c) if (c[k] > 1) printf "%s | count=%d\n", sample[k], c[k]}' | head -n 10)
+    duplicates=$(
+        ps -eo ppid=,pid=,comm=,args= 2>/dev/null \
+        | awk '
+            {
+                cmd_start = index($0,$4);
+                cmd = (cmd_start>0 ? substr($0,cmd_start) : "-");
+                key=$3"|"cmd;
+                c[key]++;
+                if (!sample_ppid[key]) sample_ppid[key]=$1;
+                if (!sample_pid[key]) sample_pid[key]=$2;
+                if (!sample_comm[key]) sample_comm[key]=$3;
+                if (!sample_cmd[key]) sample_cmd[key]=cmd;
+            }
+            END {for (k in c) if (c[k] > 1) printf "%-8s %-8s %-20s %-36s %5d\n", sample_ppid[k], sample_pid[k], sample_comm[k], sample_cmd[k], c[k]; }' \
+        | head -n 12
+    )
     if [ -n "$duplicates" ]; then
         print_status "WARN" "Potential duplicate workloads:"
-        echo "$duplicates" | sed 's/^/  - /'
+        echo "  PPID     PID      PROCESS              COMMAND                              COUNT"
+        echo "  -------------------------------------------------------------------------------"
+        echo "$duplicates" | sed 's/^/  /'
     else
         print_status "SUCCESS" "No significant duplicate process pattern found"
     fi
@@ -1888,18 +2024,45 @@ show_duplicate_process_detection() {
 show_process_abnormal_patterns() {
     print_section "LEAK / ABNORMAL PATTERN DETECTION"
     print_breadcrumb "Service & Log Management > Processes > Abnormal Patterns"
-    print_context_help "الگوهای پرخطر: CPU pegging, RAM pressure, zombie accumulation."
+    print_context_help "High-risk patterns: CPU pegging, RAM pressure, zombie accumulation."
 
     local pegged highmem zombies
-    pegged=$(ps -eo pid,comm,%cpu --sort=-%cpu 2>/dev/null | awk '$3 > 90 {print}')
-    highmem=$(ps -eo pid,comm,%mem --sort=-%mem 2>/dev/null | awk '$3 > 20 {print}')
-    zombies=$(ps -eo stat= 2>/dev/null | grep -c Z || true)
+    pegged=$(
+        ps -eo pid=,comm=,%cpu=,args= --sort=-%cpu 2>/dev/null \
+        | awk -v threshold="$CPU_PEG_THRESHOLD" '$3 > threshold {printf "%-8s %-20s CPU=%-6s %s\n", $1, $2, $3"%", substr($0, index($0,$4))}' \
+        | head -n 5
+    )
 
-    [ -n "$pegged" ] && { print_status "WARN" "CPU pegging processes (>90%):"; echo "$pegged" | head -n 5 | sed 's/^/  - /'; } || print_status "SUCCESS" "No CPU pegging process detected"
-    [ -n "$highmem" ] && { print_status "WARN" "High memory processes (>20%):"; echo "$highmem" | head -n 5 | sed 's/^/  - /'; } || print_status "SUCCESS" "No single process with very high memory usage"
+    highmem=$(
+        ps -eo pid=,comm=,%mem=,rss=,args= --sort=-%mem 2>/dev/null \
+        | awk -v threshold="$MEM_HIGH_THRESHOLD" '$3 > threshold {printf "%-8s %-20s MEM=%-6s RSS=%sKB  %s\n", $1, $2, $3"%", $4, substr($0, index($0,$5))}' \
+        | head -n 5
+    )
+
+    zombies=$(
+        ps -eo stat= 2>/dev/null \
+        | awk '$1 ~ /Z/ {count++} END {print count+0}'
+    )
+
+    if [ -n "$pegged" ]; then
+        print_status "WARN" "CPU pegging processes (>${CPU_PEG_THRESHOLD}%):"
+        echo "$pegged" | sed 's/^/  - /'
+    else
+        print_status "SUCCESS" "No CPU pegging process detected"
+    fi
+
+    if [ -n "$highmem" ]; then
+        print_status "WARN" "High memory processes (>${MEM_HIGH_THRESHOLD}%):"
+        echo "$highmem" | sed 's/^/  - /'
+    else
+        print_status "SUCCESS" "No single process with very high memory usage"
+    fi
 
     if [ "$zombies" -gt 0 ]; then
         print_status "WARN" "Zombie processes detected: $zombies"
+        ps -eo pid=,ppid=,stat=,comm=,args= 2>/dev/null \
+            | awk '$3 ~ /Z/ {printf "  - PID=%s PPID=%s STAT=%s CMD=%s\n", $1, $2, $3, substr($0, index($0,$5))}' \
+            | head -n 10
     else
         print_status "SUCCESS" "No zombie process accumulation"
     fi
@@ -1908,7 +2071,7 @@ show_process_abnormal_patterns() {
 show_process_action_center() {
     print_section "PROCESS ACTION CENTER"
     print_breadcrumb "Service & Log Management > Processes > Action Center"
-    print_context_help "اقدامات امن پیشنهادی: nice/renice/ionice/restart/kill + ثبت audit trail."
+    print_context_help "Recommended safe actions: nice/renice/ionice/restart/kill + audit trail logging."
 
     cat <<EOF
   Suggested safe actions:
@@ -1943,7 +2106,7 @@ render_service_log_dashboard() {
     local overview_alert=0
     print_header "SERVICE & LOG MANAGEMENT - UNIFIED DASHBOARD"
     print_breadcrumb "Main Menu > Service & Log Management"
-    print_context_help "داشبورد یکپارچه لاگ، سرویس‌ها، Runtime Audit و Process Intelligence."
+    print_context_help "Unified dashboard for logs, services, runtime audit, and process intelligence."
 
     print_installed_services_overview
     overview_alert=$?
@@ -1957,6 +2120,10 @@ render_service_log_dashboard() {
     show_database_section
     show_cache_section
     show_apache_section
+    show_nodejs_section
+    show_python_section
+    show_ufw_section
+    show_pm2_section
     build_unified_log_pipeline
     show_smart_error_digest
     show_log_anomaly_detection
