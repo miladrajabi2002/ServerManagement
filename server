@@ -71,7 +71,14 @@ print_breadcrumb() {
 
 print_context_help() {
     local help_text="$1"
-    echo -e "${GRAY}  💡 ${help_text}${NC}"
+    echo -e "${GRAY}  💡 ${help_text}${NC}\n"
+}
+
+print_subheading() {
+    local title="$1"
+    local description="${2:-}"
+    echo -e "\n${MAGENTA}${BOLD}  ── ${title} ──${NC}"
+    [ -n "$description" ] && echo -e "${DIM}     ${description}${NC}"
 }
 
 print_status() {
@@ -1496,8 +1503,13 @@ print_installed_services_overview() {
 
     check_service_status "docker" "Docker"
     check_service_status "ufw" "UFW Firewall"
-    check_service_status "pm2-root" "PM2 (root)"
-    check_service_status "pm2" "PM2"
+    if service_exists "pm2-root"; then
+        check_service_status "pm2-root" "PM2"
+    elif service_exists "pm2"; then
+        check_service_status "pm2" "PM2"
+    else
+        echo -e "  ${DIM}○${NC} PM2: ${DIM}Not installed${NC}"
+    fi
 
     if command -v node >/dev/null 2>&1; then
         print_status "INFO" "Node.js: $(node --version 2>/dev/null)"
@@ -1526,29 +1538,28 @@ show_nginx_section() {
     systemctl status nginx --no-pager | head -n 5
     print_status "INFO" "Active Connections: $(ss -tn 2>/dev/null | grep -E ':80|:443' | wc -l)"
 
-    echo -e "\n${CYAN}${BOLD}Top 5 Requested URLs:${NC}"
+    print_subheading "Top 5 Requested URLs" "Most frequently requested paths across all requests."
     awk '{print $7}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
 
-    echo -e "\n${CYAN}${BOLD}Top 5 IPs Requesting (/):${NC}"
-    echo -e "${DIM}  Clients repeatedly hitting the root path (/). Useful to spot load balancers, bots, or floods.${NC}"
+    print_subheading "Top 5 IPs Requesting (/)" "Only requests targeting root path (/). Helps identify homepage floods, bots, or probes."
     awk '($7 == "/") {print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
 
-    echo -e "\n${CYAN}${BOLD}High Request Rate IPs - Top 5:${NC}"
+    print_subheading "High Request Rate IPs - Top 5" "All paths combined per IP. Shows overall traffic-heavy clients, not just root (/)."
     awk '{print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 5
 
-    echo -e "\n${CYAN}${BOLD}404 Errors - Top 10:${NC}"
+    print_subheading "404 Errors - Top 10" "Most missing URLs that returned HTTP 404."
     awk '($9 == "404") {print $7}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -n 10
 
-    echo -e "\n${CYAN}${BOLD}Suspicious User Agents:${NC}"
+    print_subheading "Suspicious User Agents" "Matched bot/crawler/scraper/scan patterns from access logs."
     awk -F'"' '{print $6}' "$NGINX_ACCESS_LOG" 2>/dev/null | grep -iE "bot|crawler|spider|scraper|scan" | sort | uniq -c | sort -rn | head -n 10
 
     local nginx_err
     nginx_err=$(service_error_summary "nginx" "$NGINX_ERROR_LOG")
+    echo ""
     if [ -n "$nginx_err" ]; then
         print_status "ERROR" "Nginx alert: $nginx_err"
     else
         print_status "SUCCESS" "No critical nginx errors found in recent checks"
-        echo ""
     fi
 }
 
@@ -1620,6 +1631,7 @@ SELECT
             print_status "ERROR" "Database alert ($db_service): $db_err"
         fi
     done
+    echo ""
     [ "$db_alert" -eq 0 ] && print_status "SUCCESS" "No critical database errors found in recent checks"
 }
 
@@ -1649,6 +1661,7 @@ show_cache_section() {
 
     local cache_err
     cache_err=$(service_error_summary "$cache_service" "/var/log/redis/redis-server.log")
+    echo ""
     if [ -n "$cache_err" ]; then
         print_status "ERROR" "Redis/Dragonfly alert: $cache_err"
     else
@@ -1683,6 +1696,7 @@ show_apache_section() {
 
     local apache_err
     apache_err=$(service_error_summary "$apache_service" "$apache_error_log")
+    echo ""
     if [ -n "$apache_err" ]; then
         print_status "ERROR" "Apache alert: $apache_err"
     else
@@ -1733,6 +1747,7 @@ show_python_section() {
 
     local py_err
     py_err=$(journalctl -p err -n 200 --no-pager 2>/dev/null | grep -i "python" | tail -n 1)
+    echo ""
     if [ -n "$py_err" ]; then
         print_status "WARN" "Recent Python-related error: $py_err"
     else
@@ -2123,7 +2138,6 @@ render_service_log_dashboard() {
     show_nodejs_section
     show_python_section
     show_ufw_section
-    show_pm2_section
     build_unified_log_pipeline
     show_smart_error_digest
     show_log_anomaly_detection
