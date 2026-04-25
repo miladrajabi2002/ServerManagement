@@ -1070,301 +1070,572 @@ monitoring() {
 #==============================================================================
 
 check_ip_reputation() {
-    print_header "IP REPUTATION & SECURITY ANALYSIS"
-    
-    echo -ne "${CYAN}▸ Fetching your public IP address...${NC}\r"
-    PUBLIC_IP=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || echo "N/A")
-    
-    if [ "$PUBLIC_IP" = "N/A" ]; then
-        print_status "ERROR" "Cannot retrieve public IP address"
-        press_enter
-        return
-    fi
-    
-    echo -e "${GREEN}  ✓ Your Public IP: ${YELLOW}${BOLD}$PUBLIC_IP${NC}                    \n"
-    
-    local total_checks=0
-    local passed_checks=0
-    local critical_issues=0
-    
-    echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}${BOLD}  SECURITY ANALYSIS IN PROGRESS${NC}"
-    echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
-    
-    # Test 1: IP-API
-    echo -e "${BOLD}[1/8] 🌍 IP Geolocation & ISP Analysis${NC}"
-    echo -ne "${DIM}  ▸ Checking...${NC}\r"
-    
-    ip_info=$(curl -s --max-time 8 "http://ip-api.com/json/$PUBLIC_IP?fields=status,country,city,isp,org,proxy,hosting" 2>/dev/null)
-    
-    if [ -n "$ip_info" ] && echo "$ip_info" | grep -q "success"; then
-        country=$(echo "$ip_info" | grep -o '"country":"[^"]*' | cut -d'"' -f4)
-        city=$(echo "$ip_info" | grep -o '"city":"[^"]*' | cut -d'"' -f4)
-        isp=$(echo "$ip_info" | grep -o '"isp":"[^"]*' | cut -d'"' -f4)
-        is_proxy=$(echo "$ip_info" | grep -o '"proxy":true' | wc -l)
-        is_hosting=$(echo "$ip_info" | grep -o '"hosting":true' | wc -l)
-        
-        echo -e "  ${GREEN}✓${NC} Location: ${CYAN}$city, $country${NC}       "
-        echo -e "  ${GREEN}✓${NC} ISP: ${CYAN}${isp:0:50}${NC}"
-        
-        total_checks=$((total_checks + 1))
-        
-        if [ $is_proxy -eq 0 ]; then
-            passed_checks=$((passed_checks + 1))
-            echo -e "  ${GREEN}✓${NC} Proxy Status: ${GREEN}Clean${NC}"
+    # Optional usage: check_ip_reputation 1.2.3.4
+    local C_NC="${NC:-}" C_BOLD="${BOLD:-}" C_DIM="${DIM:-}" C_GRAY="${GRAY:-}"
+    local C_RED="${RED:-}" C_GREEN="${GREEN:-}" C_YELLOW="${YELLOW:-}" C_BLUE="${BLUE:-}" C_CYAN="${CYAN:-}"
+    local TIMEOUT="${IP_REP_TIMEOUT:-8}"
+    local USER_AGENT="IP-Reputation-Check/2.0 (+https://example.local)"
+
+    _ipr_header() {
+        if declare -F print_header >/dev/null 2>&1; then
+            print_header "$1"
         else
-            echo -e "  ${RED}✗${NC} Proxy Status: ${RED}Detected${NC}"
-            critical_issues=$((critical_issues + 1))
+            echo -e "\n${C_CYAN}${C_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
+            echo -e "${C_CYAN}${C_BOLD}  $1${C_NC}"
+            echo -e "${C_CYAN}${C_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}\n"
         fi
-        
-        if [ $is_hosting -eq 1 ]; then
-            echo -e "  ${YELLOW}⚠${NC} Type: ${YELLOW}Datacenter/VPS${NC}"
+    }
+
+    _ipr_pause() {
+        if declare -F press_enter >/dev/null 2>&1; then
+            press_enter
         else
-            echo -e "  ${GREEN}✓${NC} Type: ${GREEN}Residential${NC}"
+            read -r -p "Press Enter to continue... " _
         fi
-    else
-        echo -e "  ${RED}✗${NC} Check failed       "
-    fi
-    echo ""
-    
-    # Test 2: IPQualityScore
-    echo -e "${BOLD}[2/8] 🔍 Fraud Detection Analysis${NC}"
-    echo -ne "${DIM}  ▸ Checking...${NC}\r"
-    
-    ipqs=$(curl -s --max-time 8 "https://www.ipqualityscore.com/api/json/ip/free/$PUBLIC_IP" 2>/dev/null)
-    
-    if [ -n "$ipqs" ]; then
-        fraud=$(echo "$ipqs" | grep -o '"fraud_score":[0-9]*' | cut -d':' -f2)
-        vpn=$(echo "$ipqs" | grep -o '"vpn":true' | wc -l)
-        proxy=$(echo "$ipqs" | grep -o '"proxy":true' | wc -l)
-        tor=$(echo "$ipqs" | grep -o '"tor":true' | wc -l)
-        
+    }
+
+    _ipr_status() {
+        if declare -F print_status >/dev/null 2>&1; then
+            print_status "$1" "$2"
+        else
+            echo -e "[$1] $2"
+        fi
+    }
+
+    _ipr_get() {
+        local url="$1"; shift || true
+        curl -sS -L --connect-timeout 4 --max-time "$TIMEOUT" -A "$USER_AGENT" "$@" "$url" 2>/dev/null || true
+    }
+
+    _ipr_json() {
+        local json="$1" path="$2"
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$json" | jq -r "$path // empty" 2>/dev/null
+        elif command -v python3 >/dev/null 2>&1; then
+            PY_JSON="$json" PY_PATH="$path" python3 - <<'PY' 2>/dev/null
+import json, os, sys
+try:
+    obj = json.loads(os.environ.get("PY_JSON", ""))
+except Exception:
+    sys.exit(0)
+path = os.environ.get("PY_PATH", "").strip()
+if path.startswith('.'):
+    path = path[1:]
+cur = obj
+if path:
+    for part in path.split('.'):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            cur = None
+            break
+if cur is None:
+    sys.exit(0)
+if isinstance(cur, bool):
+    print("true" if cur else "false")
+elif isinstance(cur, (dict, list)):
+    print(json.dumps(cur, separators=(",", ":")))
+else:
+    print(cur)
+PY
+        else
+            local key="${path#.}"
+            printf '%s' "$json" | sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p; t; s/.*\"$key\"[[:space:]]*:[[:space:]]*([^,}]+).*/\1/p" | head -n1 | tr -d '"'
+        fi
+    }
+
+    _ipr_json_len() {
+        local json="$1" path="$2"
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$json" | jq -r "($path // []) | length" 2>/dev/null || echo 0
+        elif command -v python3 >/dev/null 2>&1; then
+            PY_JSON="$json" PY_PATH="$path" python3 - <<'PY' 2>/dev/null
+import json, os
+try:
+    obj = json.loads(os.environ.get("PY_JSON", ""))
+except Exception:
+    print(0); raise SystemExit
+path = os.environ.get("PY_PATH", "").strip()
+if path.startswith('.'):
+    path = path[1:]
+cur = obj
+if path:
+    for part in path.split('.'):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            cur = []
+            break
+print(len(cur) if hasattr(cur, '__len__') else 0)
+PY
+        else
+            echo 0
+        fi
+    }
+
+    _ipr_json_csv() {
+        local json="$1" path="$2"
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$json" | jq -r "($path // []) | if type==\"array\" then map(tostring) | join(\",\") else tostring end" 2>/dev/null
+        elif command -v python3 >/dev/null 2>&1; then
+            PY_JSON="$json" PY_PATH="$path" python3 - <<'PY' 2>/dev/null
+import json, os, sys
+try:
+    obj = json.loads(os.environ.get("PY_JSON", ""))
+except Exception:
+    sys.exit(0)
+path = os.environ.get("PY_PATH", "").strip()
+if path.startswith('.'):
+    path = path[1:]
+cur = obj
+if path:
+    for part in path.split('.'):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            cur = []
+            break
+if isinstance(cur, list):
+    print(",".join(str(x) for x in cur))
+elif cur is not None:
+    print(cur)
+PY
+        else
+            echo ""
+        fi
+    }
+
+    _ipr_is_ipv4() {
+        local ip="$1"
+        awk -F. 'NF==4 { for (i=1;i<=4;i++) if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1; exit 0 } { exit 1 }' <<< "$ip"
+    }
+
+    _ipr_version() {
+        local ip="$1"
+        if _ipr_is_ipv4 "$ip"; then
+            echo 4
+        elif [[ "$ip" == *:* ]]; then
+            echo 6
+        else
+            echo 0
+        fi
+    }
+
+    local total_checks=0 passed_checks=0 critical_issues=0 warning_issues=0
+    local total_weight=0 earned_weight=0 skipped_checks=0
+
+    _ipr_score() {
+        local weight="${1:-0}" state="$2"
+        [[ "$weight" =~ ^[0-9]+$ ]] || weight=0
+        [ "$weight" -gt 0 ] || return 0
         total_checks=$((total_checks + 1))
-        
-        if [ -n "$fraud" ]; then
-            if [ "$fraud" -lt 50 ]; then
+        total_weight=$((total_weight + weight))
+        case "$state" in
+            pass)
                 passed_checks=$((passed_checks + 1))
-                echo -e "  ${GREEN}✓${NC} Fraud Score: ${GREEN}${BOLD}$fraud/100${NC} ${GREEN}(Low Risk)${NC}       "
-            elif [ "$fraud" -lt 75 ]; then
-                echo -e "  ${YELLOW}⚠${NC} Fraud Score: ${YELLOW}${BOLD}$fraud/100${NC} ${YELLOW}(Medium Risk)${NC}"
-            else
-                echo -e "  ${RED}✗${NC} Fraud Score: ${RED}${BOLD}$fraud/100${NC} ${RED}(High Risk)${NC}"
-                critical_issues=$((critical_issues + 1))
-            fi
-        fi
-        
-        [ $vpn -eq 0 ] && echo -e "  ${GREEN}✓${NC} VPN: ${GREEN}Not detected${NC}" || echo -e "  ${RED}✗${NC} VPN: ${RED}Detected${NC}"
-        [ $proxy -eq 0 ] && echo -e "  ${GREEN}✓${NC} Proxy: ${GREEN}Not detected${NC}" || echo -e "  ${RED}✗${NC} Proxy: ${RED}Detected${NC}"
-        [ $tor -eq 0 ] && echo -e "  ${GREEN}✓${NC} Tor: ${GREEN}Not detected${NC}" || echo -e "  ${RED}✗${NC} Tor: ${RED}Detected${NC}"
-    else
-        echo -e "  ${RED}✗${NC} Check failed       "
-    fi
-    echo ""
-    
-    # Test 3: Shodan
-    echo -e "${BOLD}[3/8] 🔓 Port & Vulnerability Scanner${NC}"
-    echo -ne "${DIM}  ▸ Checking...${NC}\r"
-    
-    shodan=$(curl -s --max-time 8 "https://internetdb.shodan.io/$PUBLIC_IP" 2>/dev/null)
-    
-    if [ -n "$shodan" ] && ! echo "$shodan" | grep -q "No information"; then
-        ports=$(echo "$shodan" | grep -o '"ports":\[[^]]*\]' | grep -o '[0-9]*' | tr '\n' ',' | sed 's/,$//')
-        vulns=$(echo "$shodan" | grep -o '"vulns":\[[^]]*\]' | grep -o 'CVE-[0-9-]*' | wc -l)
-        
-        if [ -n "$ports" ]; then
-            echo -e "  ${YELLOW}⚠${NC} Open Ports: ${YELLOW}$ports${NC}       "
-        else
-            echo -e "  ${GREEN}✓${NC} No common ports exposed       "
-        fi
-        
-        if [ "$vulns" -gt 0 ]; then
-            echo -e "  ${RED}✗${NC} Vulnerabilities: ${RED}$vulns CVEs found${NC}"
-            critical_issues=$((critical_issues + 1))
-        else
-            echo -e "  ${GREEN}✓${NC} No known vulnerabilities       "
-        fi
-    else
-        echo -e "  ${GREEN}✓${NC} Not indexed (good)       "
-    fi
-    echo ""
-    
-    # Test 4: DNS Blacklists
-    echo -e "${BOLD}[4/8] 📋 DNS Blacklist Check${NC}"
-    echo -ne "${DIM}  ▸ Checking...${NC}\r"
-    
-    reversed_ip=$(echo "$PUBLIC_IP" | awk -F. '{print $4"."$3"."$2"."$1}')
-    blacklisted=0
-    bl_names=""
-    
-    for rbl in "zen.spamhaus.org" "bl.spamcop.net" "dnsbl.sorbs.net" "b.barracudacentral.org"; do
-        if host "${reversed_ip}.${rbl}" &>/dev/null; then
-            blacklisted=$((blacklisted + 1))
-            bl_names="$bl_names$rbl "
-        fi
-    done
-    
-    total_checks=$((total_checks + 1))
-    
-    if [ $blacklisted -eq 0 ]; then
-        passed_checks=$((passed_checks + 1))
-        echo -e "  ${GREEN}✓${NC} Status: ${GREEN}Clean (0/4 lists)${NC}       "
-    else
-        echo -e "  ${RED}✗${NC} Status: ${RED}Listed in $blacklisted/4 lists${NC}"
-        echo -e "  ${DIM}  $bl_names${NC}"
-        critical_issues=$((critical_issues + 1))
-    fi
-    echo ""
-    
-    # Test 5: IPHub
-    echo -e "${BOLD}[5/8] 🛡️  Advanced Proxy Detection${NC}"
-    echo -ne "${DIM}  ▸ Checking...${NC}\r"
-    
-    iphub=$(curl -s --max-time 8 "http://v2.api.iphub.info/ip/$PUBLIC_IP" 2>/dev/null)
-    
-    if [ -n "$iphub" ]; then
-        block=$(echo "$iphub" | grep -o '"block":[0-2]' | cut -d':' -f2)
-        total_checks=$((total_checks + 1))
-        
-        case "$block" in
-            0)
-                passed_checks=$((passed_checks + 1))
-                echo -e "  ${GREEN}✓${NC} Type: ${GREEN}Residential/Business IP${NC}       "
+                earned_weight=$((earned_weight + weight))
                 ;;
-            1)
-                echo -e "  ${RED}✗${NC} Type: ${RED}Proxy/VPN detected${NC}"
-                critical_issues=$((critical_issues + 1))
+            warn)
+                warning_issues=$((warning_issues + 1))
+                earned_weight=$((earned_weight + weight / 2))
                 ;;
-            2)
-                echo -e "  ${YELLOW}⚠${NC} Type: ${YELLOW}Hosting/Datacenter${NC}"
+            fail)
+                critical_issues=$((critical_issues + 1))
                 ;;
         esac
+    }
+
+    _ipr_ok()   { local msg="$1" weight="${2:-0}"; echo -e "  ${C_GREEN}✓${C_NC} $msg"; _ipr_score "$weight" pass; }
+    _ipr_warn() { local msg="$1" weight="${2:-0}"; echo -e "  ${C_YELLOW}⚠${C_NC} $msg"; _ipr_score "$weight" warn; }
+    _ipr_bad()  { local msg="$1" weight="${2:-0}"; echo -e "  ${C_RED}✗${C_NC} $msg"; _ipr_score "$weight" fail; }
+    _ipr_skip() { local msg="$1"; skipped_checks=$((skipped_checks + 1)); echo -e "  ${C_DIM}• $msg${C_NC}"; }
+
+    _ipr_rbl_answers() {
+        local q="$1"
+        if command -v dig >/dev/null 2>&1; then
+            dig +short A "$q" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+        elif command -v host >/dev/null 2>&1; then
+            host "$q" 2>/dev/null | awk '/has address/ {print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+        elif command -v nslookup >/dev/null 2>&1; then
+            nslookup "$q" 2>/dev/null | awk '/^Address: / {print $2}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+        else
+            return 2
+        fi
+    }
+
+    _ipr_header "IP REPUTATION & SECURITY ANALYSIS"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        _ipr_status "ERROR" "curl is required but not installed."
+        _ipr_pause
+        return 1
+    fi
+
+    local PUBLIC_IP="${1:-}" ip_ver
+    if [ -z "$PUBLIC_IP" ]; then
+        echo -ne "${C_CYAN}▸ Fetching your public IPv4 address...${C_NC}\r"
+        PUBLIC_IP=$(curl -4 -fsS --connect-timeout 4 --max-time "$TIMEOUT" https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -z "$PUBLIC_IP" ]; then
+            echo -ne "${C_CYAN}▸ IPv4 failed, trying IPv4/IPv6 endpoint...${C_NC}\r"
+            PUBLIC_IP=$(curl -fsS --connect-timeout 4 --max-time "$TIMEOUT" https://api64.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+        fi
+    fi
+
+    ip_ver="$(_ipr_version "$PUBLIC_IP")"
+    if [ -z "$PUBLIC_IP" ] || [ "$ip_ver" = "0" ]; then
+        echo ""
+        _ipr_status "ERROR" "Cannot retrieve or validate public IP address."
+        _ipr_pause
+        return 1
+    fi
+
+    echo -e "${C_GREEN}  ✓ Target IP: ${C_YELLOW}${C_BOLD}$PUBLIC_IP${C_NC} ${C_DIM}(IPv$ip_ver)${C_NC}                    \n"
+
+    echo -e "${C_CYAN}${C_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
+    echo -e "${C_CYAN}${C_BOLD}  SECURITY ANALYSIS IN PROGRESS${C_NC}"
+    echo -e "${C_CYAN}${C_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}\n"
+
+    # 1) IP-API: geolocation, ASN, proxy/hosting/mobile signals
+    echo -e "${C_BOLD}[1/10] 🌍 Geolocation, ASN & Basic Proxy Signals${C_NC}"
+    echo -ne "${C_DIM}  ▸ Checking IP-API...${C_NC}\r"
+    local ip_info status country city region isp org asn asname is_proxy is_hosting is_mobile
+    ip_info="$(_ipr_get "http://ip-api.com/json/$PUBLIC_IP?fields=status,message,country,regionName,city,isp,org,as,asname,proxy,hosting,mobile,query")"
+    status="$(_ipr_json "$ip_info" ".status")"
+    if [ "$status" = "success" ]; then
+        country="$(_ipr_json "$ip_info" ".country")"
+        region="$(_ipr_json "$ip_info" ".regionName")"
+        city="$(_ipr_json "$ip_info" ".city")"
+        isp="$(_ipr_json "$ip_info" ".isp")"
+        org="$(_ipr_json "$ip_info" ".org")"
+        asn="$(_ipr_json "$ip_info" ".as")"
+        asname="$(_ipr_json "$ip_info" ".asname")"
+        is_proxy="$(_ipr_json "$ip_info" ".proxy")"
+        is_hosting="$(_ipr_json "$ip_info" ".hosting")"
+        is_mobile="$(_ipr_json "$ip_info" ".mobile")"
+
+        _ipr_ok "Location: ${C_CYAN}${city:-N/A}${region:+, $region}${country:+, $country}${C_NC}"
+        _ipr_ok "ISP/Org: ${C_CYAN}${isp:-N/A}${org:+ / $org}${C_NC}"
+        [ -n "$asn" ] && _ipr_ok "ASN: ${C_CYAN}$asn${asname:+ ($asname)}${C_NC}"
+
+        if [ "$is_proxy" = "true" ]; then
+            _ipr_bad "IP-API Proxy/VPN/Tor Signal: ${C_RED}Detected${C_NC}" 12
+        else
+            _ipr_ok "IP-API Proxy/VPN/Tor Signal: ${C_GREEN}Clean${C_NC}" 12
+        fi
+
+        if [ "$is_hosting" = "true" ]; then
+            _ipr_warn "Network Type: ${C_YELLOW}Datacenter / Hosting${C_NC}" 6
+        else
+            _ipr_ok "Network Type: ${C_GREEN}Not marked as hosting/datacenter${C_NC}" 6
+        fi
+
+        [ "$is_mobile" = "true" ] && _ipr_ok "Mobile Network: ${C_CYAN}Yes${C_NC}" || _ipr_ok "Mobile Network: ${C_CYAN}No/Unknown${C_NC}"
     else
-        echo -e "  ${YELLOW}⚠${NC} Check unavailable       "
+        _ipr_skip "IP-API check unavailable or rate-limited."
     fi
     echo ""
-    
-    # Test 6: Scamalytics
-    echo -e "${BOLD}[6/8] 🎯 Scamalytics Fraud Score${NC}"
-    echo -ne "${DIM}  ▸ Checking...${NC}\r"
-    
-    scam=$(curl -s --max-time 8 "https://scamalytics.com/ip/$PUBLIC_IP" 2>/dev/null)
-    
-    if [ -n "$scam" ]; then
-        fraud_scam=$(echo "$scam" | grep -o 'Fraud Score: [0-9]*' | grep -o '[0-9]*' | head -1)
-        total_checks=$((total_checks + 1))
-        
-        if [ -n "$fraud_scam" ]; then
-            if [ "$fraud_scam" -lt 25 ]; then
-                passed_checks=$((passed_checks + 1))
-                echo -e "  ${GREEN}✓${NC} Score: ${GREEN}${BOLD}$fraud_scam/100${NC} ${GREEN}(Very Low)${NC}       "
-            elif [ "$fraud_scam" -lt 75 ]; then
-                echo -e "  ${YELLOW}⚠${NC} Score: ${YELLOW}${BOLD}$fraud_scam/100${NC}"
+
+    # 2) Shodan InternetDB: open ports and known CVEs
+    echo -e "${C_BOLD}[2/10] 🔓 Shodan InternetDB Exposure Check${C_NC}"
+    echo -ne "${C_DIM}  ▸ Checking InternetDB...${C_NC}\r"
+    local shodan ports vulns_len vulns_csv ports_len
+    shodan="$(_ipr_get "https://internetdb.shodan.io/$PUBLIC_IP")"
+    if [ -n "$shodan" ] && printf '%s' "$shodan" | grep -q '"ports"'; then
+        ports="$(_ipr_json_csv "$shodan" ".ports")"
+        ports_len="$(_ipr_json_len "$shodan" ".ports")"
+        vulns_len="$(_ipr_json_len "$shodan" ".vulns")"
+        vulns_csv="$(_ipr_json_csv "$shodan" ".vulns")"
+
+        if [ "${ports_len:-0}" -gt 0 ]; then
+            _ipr_warn "Open Ports Indexed: ${C_YELLOW}${ports:-N/A}${C_NC}" 5
+        else
+            _ipr_ok "Open Ports Indexed: ${C_GREEN}None${C_NC}" 5
+        fi
+
+        if [ "${vulns_len:-0}" -gt 0 ]; then
+            _ipr_bad "Known Vulnerabilities: ${C_RED}$vulns_len CVE(s)${C_NC}${vulns_csv:+ - $vulns_csv}" 18
+        else
+            _ipr_ok "Known Vulnerabilities: ${C_GREEN}None in InternetDB${C_NC}" 18
+        fi
+    elif printf '%s' "$shodan" | grep -qi 'No information\|not found'; then
+        _ipr_ok "InternetDB: ${C_GREEN}Not indexed / no known exposure${C_NC}" 18
+    else
+        _ipr_skip "InternetDB check unavailable."
+    fi
+    echo ""
+
+    # 3) DNSBL/RBL checks - IPv4 only
+    echo -e "${C_BOLD}[3/10] 📋 DNS Blacklist Check${C_NC}"
+    echo -ne "${C_DIM}  ▸ Querying DNSBLs...${C_NC}\r"
+    if [ "$ip_ver" = "4" ]; then
+        local reversed_ip blacklisted=0 rbl_errors=0 bl_names="" err_names="" rbl ans
+        reversed_ip=$(awk -F. '{print $4"."$3"."$2"."$1}' <<< "$PUBLIC_IP")
+        local rbls=("zen.spamhaus.org" "bl.spamcop.net" "dnsbl.sorbs.net" "b.barracudacentral.org")
+        local have_dns_tool=1
+        if ! command -v dig >/dev/null 2>&1 && ! command -v host >/dev/null 2>&1 && ! command -v nslookup >/dev/null 2>&1; then
+            have_dns_tool=0
+        fi
+
+        if [ "$have_dns_tool" -eq 0 ]; then
+            _ipr_skip "No DNS lookup tool found. Install dnsutils/bind-utils."
+        else
+            for rbl in "${rbls[@]}"; do
+                ans="$(_ipr_rbl_answers "${reversed_ip}.${rbl}")"
+                if [ -n "$ans" ]; then
+                    if printf '%s\n' "$ans" | grep -qE '^127\.255\.255\.'; then
+                        rbl_errors=$((rbl_errors + 1))
+                        err_names="$err_names$rbl($ans) "
+                    else
+                        blacklisted=$((blacklisted + 1))
+                        bl_names="$bl_names$rbl($ans) "
+                    fi
+                fi
+            done
+
+            if [ "$blacklisted" -eq 0 ] && [ "$rbl_errors" -eq 0 ]; then
+                _ipr_ok "DNSBL Status: ${C_GREEN}Clean (0/${#rbls[@]} lists)${C_NC}" 18
+            elif [ "$blacklisted" -gt 0 ]; then
+                _ipr_bad "DNSBL Status: ${C_RED}Listed in $blacklisted/${#rbls[@]} list(s)${C_NC}" 18
+                echo -e "  ${C_DIM}$bl_names${C_NC}"
+                [ "$rbl_errors" -gt 0 ] && echo -e "  ${C_DIM}Resolver warnings ignored: $err_names${C_NC}"
             else
-                echo -e "  ${RED}✗${NC} Score: ${RED}${BOLD}$fraud_scam/100${NC} ${RED}(High)${NC}"
-                critical_issues=$((critical_issues + 1))
+                _ipr_warn "DNSBL Status: ${C_YELLOW}Resolver returned blocked/error codes; result not reliable${C_NC}" 6
+                echo -e "  ${C_DIM}$err_names${C_NC}"
+            fi
+        fi
+    else
+        _ipr_skip "DNSBL checks skipped for IPv6. Most classic RBL zones here are IPv4-oriented."
+    fi
+    echo ""
+
+    # 4) Tor Project bulk exit list
+    echo -e "${C_BOLD}[4/10] 🧅 Tor Exit Node Check${C_NC}"
+    echo -ne "${C_DIM}  ▸ Checking Tor Project exit list...${C_NC}\r"
+    local tor_list
+    tor_list="$(_ipr_get "https://check.torproject.org/torbulkexitlist")"
+    if [ -n "$tor_list" ]; then
+        if printf '%s\n' "$tor_list" | grep -Fxq "$PUBLIC_IP"; then
+            _ipr_bad "Tor Exit Node: ${C_RED}Detected${C_NC}" 18
+        else
+            _ipr_ok "Tor Exit Node: ${C_GREEN}Not listed${C_NC}" 18
+        fi
+    else
+        _ipr_skip "Tor exit list unavailable."
+    fi
+    echo ""
+
+    # 5) GetIPIntel - free, but requires a real contact email
+    echo -e "${C_BOLD}[5/10] 📊 GetIPIntel Proxy Probability${C_NC}"
+    local getip_contact="${GETIPINTEL_CONTACT:-}"
+    if [ -z "$getip_contact" ]; then
+        _ipr_skip "Skipped. Set GETIPINTEL_CONTACT='you@example.com' to enable this free API."
+    else
+        echo -ne "${C_DIM}  ▸ Checking GetIPIntel...${C_NC}\r"
+        local getip result prob_pct msg
+        getip="$(_ipr_get "http://check.getipintel.net/check.php?ip=$PUBLIC_IP&contact=$getip_contact&flags=m&format=json")"
+        result="$(_ipr_json "$getip" ".result")"
+        msg="$(_ipr_json "$getip" ".message")"
+        if [[ "$result" =~ ^-?[0-9]+([.][0-9]+)?$ ]] && awk -v x="$result" 'BEGIN{exit !(x >= 0 && x <= 1)}'; then
+            prob_pct=$(awk -v p="$result" 'BEGIN{printf "%.0f", p * 100}')
+            if [ "$prob_pct" -ge 99 ]; then
+                _ipr_bad "Proxy Probability: ${C_RED}${prob_pct}%${C_NC} (very high)" 14
+            elif [ "$prob_pct" -ge 95 ]; then
+                _ipr_warn "Proxy Probability: ${C_YELLOW}${prob_pct}%${C_NC} (review manually)" 14
+            else
+                _ipr_ok "Proxy Probability: ${C_GREEN}${prob_pct}%${C_NC} (low according to GetIPIntel guidance)" 14
             fi
         else
-            total_checks=$((total_checks - 1))
-            echo -e "  ${YELLOW}⚠${NC} Could not parse       "
+            _ipr_skip "GetIPIntel error or invalid response${msg:+: $msg}."
         fi
-    else
-        echo -e "  ${YELLOW}⚠${NC} Check failed       "
     fi
     echo ""
-    
-    # Test 7: GetIPIntel
-    echo -e "${BOLD}[7/8] 📊 Proxy Probability Analysis${NC}"
-    echo -ne "${DIM}  ▸ Checking...${NC}\r"
-    
-    getip=$(curl -s --max-time 8 "http://check.getipintel.net/check.php?ip=$PUBLIC_IP&contact=admin@server.local&flags=b" 2>/dev/null)
-    
-    if [ -n "$getip" ] && [ "$getip" != "-1" ] && [ "$getip" != "-2" ]; then
-        prob=$(echo "$getip" | awk '{printf "%.0f", $1 * 100}')
-        total_checks=$((total_checks + 1))
-        
-        if [ "$prob" -lt 50 ]; then
-            passed_checks=$((passed_checks + 1))
-            echo -e "  ${GREEN}✓${NC} Probability: ${GREEN}${BOLD}${prob}%${NC} ${GREEN}(Low)${NC}       "
-        elif [ "$prob" -lt 75 ]; then
-            echo -e "  ${YELLOW}⚠${NC} Probability: ${YELLOW}${BOLD}${prob}%${NC}"
+
+    # 6) Scamalytics public page - best effort HTML parsing, not authoritative API
+    echo -e "${C_BOLD}[6/10] 🎯 Scamalytics Public Fraud Score${C_NC}"
+    echo -ne "${C_DIM}  ▸ Checking Scamalytics page...${C_NC}\r"
+    local scam fraud_scam
+    scam="$(_ipr_get "https://scamalytics.com/ip/$PUBLIC_IP")"
+    fraud_scam=$({ printf '%s' "$scam" | tr '\n' ' ' | grep -Eio 'Fraud Score:[[:space:]]*[0-9]+' | head -n1 | grep -Eo '[0-9]+' | head -n1; } 2>/dev/null || true)
+    if [ -n "$fraud_scam" ]; then
+        if [ "$fraud_scam" -ge 75 ]; then
+            _ipr_bad "Scamalytics Score: ${C_RED}${fraud_scam}/100${C_NC} (high)" 8
+        elif [ "$fraud_scam" -ge 25 ]; then
+            _ipr_warn "Scamalytics Score: ${C_YELLOW}${fraud_scam}/100${C_NC} (medium)" 8
         else
-            echo -e "  ${RED}✗${NC} Probability: ${RED}${BOLD}${prob}%${NC} ${RED}(High)${NC}"
-            critical_issues=$((critical_issues + 1))
+            _ipr_ok "Scamalytics Score: ${C_GREEN}${fraud_scam}/100${C_NC} (low)" 8
         fi
     else
-        echo -e "  ${YELLOW}⚠${NC} Check unavailable       "
+        _ipr_skip "Could not parse Scamalytics public page; use their API for reliable automation."
     fi
     echo ""
-    
-    # Test 8: AbuseIPDB
-    echo -e "${BOLD}[8/8] 🚨 Abuse Report Database${NC}"
-    echo -ne "${DIM}  ▸ Checking...${NC}\r"
-    
-    abuse_page=$(curl -s --max-time 8 "https://www.abuseipdb.com/check/$PUBLIC_IP" 2>/dev/null)
-    total_checks=$((total_checks + 1))
-    
-    if echo "$abuse_page" | grep -qi "whitelisted\|not found\|clean\|0 reports"; then
-        passed_checks=$((passed_checks + 1))
-        echo -e "  ${GREEN}✓${NC} Status: ${GREEN}No abuse reports${NC}       "
-    elif echo "$abuse_page" | grep -qi "reported\|blacklist"; then
-        echo -e "  ${RED}✗${NC} Status: ${RED}Abuse reports found${NC}"
-        critical_issues=$((critical_issues + 1))
+
+    # 7) IPQualityScore - optional API key
+    echo -e "${C_BOLD}[7/10] 🔍 IPQualityScore Fraud Detection${C_NC}"
+    local ipqs_key="${IPQS_KEY:-${IPQUALITYSCORE_API_KEY:-}}"
+    if [ -z "$ipqs_key" ]; then
+        _ipr_skip "Skipped. Set IPQS_KEY to enable the official IPQualityScore API."
     else
-        echo -e "  ${YELLOW}⚠${NC} Could not verify${NC}"
-        total_checks=$((total_checks - 1))
+        echo -ne "${C_DIM}  ▸ Checking IPQualityScore...${C_NC}\r"
+        local ipqs ipqs_success fraud vpn proxy tor recent_abuse bot_status
+        ipqs="$(_ipr_get "https://www.ipqualityscore.com/api/json/ip/$ipqs_key/$PUBLIC_IP?strictness=1&allow_public_access_points=true")"
+        ipqs_success="$(_ipr_json "$ipqs" ".success")"
+        if [ "$ipqs_success" = "true" ]; then
+            fraud="$(_ipr_json "$ipqs" ".fraud_score")"
+            vpn="$(_ipr_json "$ipqs" ".vpn")"
+            proxy="$(_ipr_json "$ipqs" ".proxy")"
+            tor="$(_ipr_json "$ipqs" ".tor")"
+            recent_abuse="$(_ipr_json "$ipqs" ".recent_abuse")"
+            bot_status="$(_ipr_json "$ipqs" ".bot_status")"
+
+            fraud="${fraud%.*}"
+            if [[ "$fraud" =~ ^[0-9]+$ ]]; then
+                if [ "$fraud" -ge 90 ]; then
+                    _ipr_bad "Fraud Score: ${C_RED}${fraud}/100${C_NC} (high risk)" 16
+                elif [ "$fraud" -ge 75 ]; then
+                    _ipr_warn "Fraud Score: ${C_YELLOW}${fraud}/100${C_NC} (suspicious)" 16
+                else
+                    _ipr_ok "Fraud Score: ${C_GREEN}${fraud}/100${C_NC}" 16
+                fi
+            fi
+
+            [ "$vpn" = "true" ] && _ipr_bad "VPN: ${C_RED}Detected${C_NC}" 6 || _ipr_ok "VPN: ${C_GREEN}Not detected${C_NC}" 6
+            [ "$proxy" = "true" ] && _ipr_bad "Proxy: ${C_RED}Detected${C_NC}" 6 || _ipr_ok "Proxy: ${C_GREEN}Not detected${C_NC}" 6
+            [ "$tor" = "true" ] && _ipr_bad "Tor: ${C_RED}Detected${C_NC}" 6 || _ipr_ok "Tor: ${C_GREEN}Not detected${C_NC}" 6
+            [ "$recent_abuse" = "true" ] && _ipr_warn "Recent Abuse: ${C_YELLOW}Yes${C_NC}" 8 || _ipr_ok "Recent Abuse: ${C_GREEN}No${C_NC}" 8
+            [ "$bot_status" = "true" ] && _ipr_warn "Bot Status: ${C_YELLOW}Yes${C_NC}" 6 || _ipr_ok "Bot Status: ${C_GREEN}No${C_NC}" 6
+        else
+            _ipr_skip "IPQualityScore returned an error or invalid API key."
+        fi
     fi
     echo ""
-    
-    # Final Score
-    echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}${BOLD}  FINAL REPUTATION ANALYSIS${NC}"
-    echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
-    
-    [ $total_checks -eq 0 ] && total_checks=1
-    score=$((passed_checks * 100 / total_checks))
-    
-    # Progress bar for score
-    filled=$((score / 2))
-    empty=$((50 - filled))
-    
-    if [ $score -ge 80 ]; then
-        color="${GREEN}"
-        status="✓ CLEAN IP"
-        emoji="🟢"
-    elif [ $score -ge 60 ]; then
-        color="${YELLOW}"
-        status="⚠ MODERATE"
-        emoji="🟡"
+
+    # 8) AbuseIPDB - optional API key
+    echo -e "${C_BOLD}[8/10] 🚨 AbuseIPDB Abuse Reports${C_NC}"
+    local abuse_key="${ABUSEIPDB_KEY:-${ABUSEIPDB_API_KEY:-}}"
+    if [ -z "$abuse_key" ]; then
+        _ipr_skip "Skipped. Set ABUSEIPDB_KEY to enable the official AbuseIPDB API."
     else
-        color="${RED}"
-        status="✗ POOR REPUTATION"
-        emoji="🔴"
+        echo -ne "${C_DIM}  ▸ Checking AbuseIPDB...${C_NC}\r"
+        local abuse abuse_score abuse_reports abuse_usage
+        abuse=$(curl -sS -G --connect-timeout 4 --max-time "$TIMEOUT" \
+            -H "Key: $abuse_key" -H "Accept: application/json" \
+            --data-urlencode "ipAddress=$PUBLIC_IP" -d "maxAgeInDays=90" \
+            "https://api.abuseipdb.com/api/v2/check" 2>/dev/null || true)
+        abuse_score="$(_ipr_json "$abuse" ".data.abuseConfidenceScore")"
+        abuse_reports="$(_ipr_json "$abuse" ".data.totalReports")"
+        abuse_usage="$(_ipr_json "$abuse" ".errors")"
+        if [[ "$abuse_score" =~ ^[0-9]+$ ]]; then
+            if [ "$abuse_score" -ge 50 ]; then
+                _ipr_bad "Abuse Confidence: ${C_RED}${abuse_score}/100${C_NC}${abuse_reports:+ ($abuse_reports reports)}" 18
+            elif [ "$abuse_score" -gt 0 ]; then
+                _ipr_warn "Abuse Confidence: ${C_YELLOW}${abuse_score}/100${C_NC}${abuse_reports:+ ($abuse_reports reports)}" 18
+            else
+                _ipr_ok "Abuse Confidence: ${C_GREEN}0/100${C_NC}${abuse_reports:+ ($abuse_reports reports)}" 18
+            fi
+        else
+            _ipr_skip "AbuseIPDB returned an error or invalid API key${abuse_usage:+: $abuse_usage}."
+        fi
     fi
-    
-    echo -e "${BOLD}Reputation Score:${NC}\n"
+    echo ""
+
+    # 9) IPHub - optional API key
+    echo -e "${C_BOLD}[9/10] 🛡️  IPHub Proxy/Datacenter Classification${C_NC}"
+    local iphub_key="${IPHUB_KEY:-${IPHUB_API_KEY:-}}"
+    if [ -z "$iphub_key" ]; then
+        _ipr_skip "Skipped. Set IPHUB_KEY to enable the official IPHub API."
+    else
+        echo -ne "${C_DIM}  ▸ Checking IPHub...${C_NC}\r"
+        local iphub block iphub_isp iphub_country
+        iphub="$(_ipr_get "http://v2.api.iphub.info/ip/$PUBLIC_IP" -H "X-Key: $iphub_key")"
+        block="$(_ipr_json "$iphub" ".block")"
+        iphub_isp="$(_ipr_json "$iphub" ".isp")"
+        iphub_country="$(_ipr_json "$iphub" ".countryName")"
+        case "$block" in
+            0)
+                _ipr_ok "IPHub Type: ${C_GREEN}Residential / Unclassified${C_NC}${iphub_isp:+ ($iphub_isp)}" 12
+                ;;
+            1)
+                _ipr_bad "IPHub Type: ${C_RED}Non-residential / server / VPN / proxy${C_NC}${iphub_isp:+ ($iphub_isp)}" 12
+                ;;
+            2)
+                _ipr_warn "IPHub Type: ${C_YELLOW}Mixed/uncertain risk${C_NC}${iphub_isp:+ ($iphub_isp)}${iphub_country:+ - $iphub_country}" 12
+                ;;
+            *)
+                _ipr_skip "IPHub returned an error or invalid API key."
+                ;;
+        esac
+    fi
+    echo ""
+
+    # 10) Reverse DNS and basic local network metadata
+    echo -e "${C_BOLD}[10/10] 🧭 Reverse DNS Sanity Check${C_NC}"
+    local rdns=""
+    if command -v dig >/dev/null 2>&1; then
+        rdns=$(dig +short -x "$PUBLIC_IP" 2>/dev/null | sed 's/\.$//' | head -n1)
+    elif command -v host >/dev/null 2>&1; then
+        rdns=$(host "$PUBLIC_IP" 2>/dev/null | awk -F'pointer ' '/pointer/ {print $2}' | sed 's/\.$//' | head -n1)
+    fi
+    if [ -n "$rdns" ]; then
+        _ipr_ok "Reverse DNS: ${C_CYAN}$rdns${C_NC}" 3
+    else
+        _ipr_warn "Reverse DNS: ${C_YELLOW}Missing or not resolvable${C_NC}" 3
+    fi
+    echo ""
+
+    echo -e "${C_CYAN}${C_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}"
+    echo -e "${C_CYAN}${C_BOLD}  FINAL REPUTATION ANALYSIS${C_NC}"
+    echo -e "${C_CYAN}${C_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_NC}\n"
+
+    local score
+    if [ "$total_weight" -gt 0 ]; then
+        score=$((earned_weight * 100 / total_weight))
+    else
+        score=0
+    fi
+
+    local filled=$((score / 2)) empty=$((50 - filled))
+    local color status_text emoji
+    if [ "$critical_issues" -eq 0 ] && [ "$score" -ge 85 ]; then
+        color="$C_GREEN"; status_text="CLEAN / LOW RISK"; emoji="🟢"
+    elif [ "$critical_issues" -le 1 ] && [ "$score" -ge 65 ]; then
+        color="$C_YELLOW"; status_text="MODERATE / REVIEW"; emoji="🟡"
+    else
+        color="$C_RED"; status_text="POOR / HIGH RISK"; emoji="🔴"
+    fi
+
+    echo -e "${C_BOLD}Reputation Score:${C_NC}\n"
     echo -ne "  $color"
-    printf '█%.0s' $(seq 1 $filled)
-    echo -ne "${GRAY}"
-    printf '░%.0s' $(seq 1 $empty)
-    echo -e "${NC} ${BOLD}${score}%${NC}\n"
-    
-    echo -e "${BLUE}┌─────────────────────────────────────────────────────────────┐${NC}"
-    printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} $color${BOLD}%-34s${NC} ${BLUE}│${NC}\n" "Status" "$emoji $status"
-    printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} ${GREEN}%-34s${NC} ${BLUE}│${NC}\n" "Checks Passed" "$passed_checks / $total_checks"
-    if [ $critical_issues -gt 0 ]; then
-        printf "${BLUE}│${NC} ${BOLD}%-20s${NC} ${BLUE}│${NC} ${RED}%-34s${NC} ${BLUE}│${NC}\n" "Critical Issues" "$critical_issues"
+    if [ "$filled" -gt 0 ]; then printf '█%.0s' $(seq 1 "$filled"); fi
+    echo -ne "$C_GRAY"
+    if [ "$empty" -gt 0 ]; then printf '░%.0s' $(seq 1 "$empty"); fi
+    echo -e "${C_NC} ${C_BOLD}${score}%${C_NC}\n"
+
+    echo -e "${C_BLUE}┌─────────────────────────────────────────────────────────────┐${C_NC}"
+    printf "${C_BLUE}│${C_NC} ${C_BOLD}%-20s${C_NC} ${C_BLUE}│${C_NC} ${color}${C_BOLD}%-34s${C_NC} ${C_BLUE}│${C_NC}\n" "Status" "$emoji $status_text"
+    printf "${C_BLUE}│${C_NC} ${C_BOLD}%-20s${C_NC} ${C_BLUE}│${C_NC} ${C_GREEN}%-34s${C_NC} ${C_BLUE}│${C_NC}\n" "Checks Passed" "$passed_checks / $total_checks"
+    printf "${C_BLUE}│${C_NC} ${C_BOLD}%-20s${C_NC} ${C_BLUE}│${C_NC} ${C_YELLOW}%-34s${C_NC} ${C_BLUE}│${C_NC}\n" "Warnings" "$warning_issues"
+    printf "${C_BLUE}│${C_NC} ${C_BOLD}%-20s${C_NC} ${C_BLUE}│${C_NC} ${C_RED}%-34s${C_NC} ${C_BLUE}│${C_NC}\n" "Critical Issues" "$critical_issues"
+    printf "${C_BLUE}│${C_NC} ${C_BOLD}%-20s${C_NC} ${C_BLUE}│${C_NC} ${C_DIM}%-34s${C_NC} ${C_BLUE}│${C_NC}\n" "Skipped" "$skipped_checks"
+    echo -e "${C_BLUE}└─────────────────────────────────────────────────────────────┘${C_NC}\n"
+
+    if [ "$score" -lt 85 ] || [ "$critical_issues" -gt 0 ]; then
+        echo -e "${C_YELLOW}${C_BOLD}⚠ RECOMMENDATIONS:${C_NC}\n"
+        [ "$critical_issues" -gt 0 ] && echo -e "  ${C_RED}•${C_NC} If this is a VPS/server, patch exposed services and close unused ports before changing IP."
+        echo -e "  ${C_CYAN}•${C_NC} If DNSBL-listed, check your mail server, rDNS/PTR, SPF/DKIM/DMARC, and abuse logs."
+        echo -e "  ${C_CYAN}•${C_NC} For more accurate paid/free-tier API checks, export keys before running:"
+        echo -e "    ${C_DIM}export ABUSEIPDB_KEY='...' IPQS_KEY='...' IPHUB_KEY='...' GETIPINTEL_CONTACT='you@example.com'${C_NC}"
+        echo -e "  ${C_CYAN}•${C_NC} Manual pages:"
+        echo -e "    ${C_BLUE}https://scamalytics.com/ip/$PUBLIC_IP${C_NC}"
+        echo -e "    ${C_BLUE}https://www.abuseipdb.com/check/$PUBLIC_IP${C_NC}"
     fi
-    echo -e "${BLUE}└─────────────────────────────────────────────────────────────┘${NC}\n"
-    
-    if [ $score -lt 80 ]; then
-        echo -e "${YELLOW}${BOLD}⚠ RECOMMENDATIONS:${NC}\n"
-        [ $critical_issues -gt 0 ] && echo -e "  ${RED}•${NC} Consider getting a new IP address"
-        echo -e "  ${CYAN}•${NC} Detailed analysis available at:"
-        echo -e "    ${BLUE}https://scamalytics.com/ip/$PUBLIC_IP${NC}"
-        echo -e "    ${BLUE}https://www.abuseipdb.com/check/$PUBLIC_IP${NC}"
-    fi
-    
-    press_enter
+
+    _ipr_pause
 }
 
 #==============================================================================
